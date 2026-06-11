@@ -1,0 +1,9 @@
+.voice-filenote-recording {
+    color: var(--color-red) !important;
+    animation: vfn-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes vfn-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}

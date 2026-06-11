@@ -1,0 +1,10 @@
+{
+    "id": "voice-filenote",
+    "name": "Voice Filenote",
+    "version": "1.0.0",
+    "minAppVersion": "1.4.0",
+    "description": "Record voice notes with Azure AI Speech transcription and GPT-4o summarisation. All data processed in Australia East.",
+    "author": "Mark Ferraretto",
+    "authorUrl": "",
+    "isDesktopOnly": true
+}
