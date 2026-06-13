@@ -1,5 +1,6 @@
 import {
     App,
+    Modal,
     Notice,
     Plugin,
     PluginSettingTab,
@@ -10,6 +11,12 @@ import {
 } from "obsidian";
 
 type RecordingMode = "new" | "append";
+
+class QuotaExceededError extends Error {
+    constructor(public readonly api: string) {
+        super(`${api} quota exceeded`);
+    }
+}
 
 interface VoiceFilenoteSettings {
     speechKey: string;
@@ -72,6 +79,21 @@ export default class VoiceFilenotePlugin extends Plugin {
             id: "toggle-recording-append",
             name: "Start / stop recording → append to current note",
             callback: () => this.toggleRecording("append"),
+        });
+
+        this.addCommand({
+            id: "transcribe-file",
+            name: "Transcribe audio file…",
+            callback: () =>
+                new AudioFileModal(this.app, this.settings.defaultMode, (file, mode) =>
+                    this.processAudioFile(file, mode)
+                ).open(),
+        });
+
+        this.addCommand({
+            id: "retry-pending",
+            name: "Retry pending transcriptions",
+            callback: () => this.retryPendingTranscriptions(),
         });
 
         this.addSettingTab(new VoiceFilenoteSettingTab(this.app, this));
@@ -198,7 +220,18 @@ export default class VoiceFilenotePlugin extends Plugin {
         await this.app.vault.createBinary(audioPath, await audioBlob.arrayBuffer());
 
         this.statusBarEl?.setText("⏳ Transcribing…");
-        const transcript = await this.transcribeAudio(audioBlob);
+        let transcript: string;
+        try {
+            transcript = await this.transcribeAudio(audioBlob);
+        } catch (err) {
+            if (err instanceof QuotaExceededError) {
+                const targetNote = mode === "append" ? (this.app.workspace.getActiveFile()?.path ?? "") : "";
+                await this.createPendingNote(timestamp, audioFilename, audioPath, mode, targetNote);
+                new Notice("Voice Filenote: Speech quota exceeded. Recording saved — run 'Retry pending transcriptions' when quota resets.");
+                return;
+            }
+            throw err;
+        }
 
         this.statusBarEl?.setText("⏳ Summarising…");
         const summary = await this.summarise(transcript);
@@ -207,6 +240,150 @@ export default class VoiceFilenotePlugin extends Plugin {
             await this.appendToCurrentNote(timestamp, audioFilename, transcript, summary);
         } else {
             await this.createNewNote(timestamp, audioFilename, transcript, summary);
+        }
+    }
+
+    private async processAudioFile(file: File, mode: RecordingMode) {
+        const timestamp = moment().format("YYYY-MM-DD HH-mm-ss");
+
+        const refNotePath =
+            mode === "append"
+                ? (this.app.workspace.getActiveFile()?.path ?? "")
+                : `${this.settings.notesFolder}/Voice Note ${timestamp}.md`;
+
+        const attachFolder = this.resolveAttachmentFolder(refNotePath);
+        await this.ensureFolder(attachFolder);
+        const audioPath = `${attachFolder}/${file.name}`;
+
+        if (!this.app.vault.getAbstractFileByPath(audioPath)) {
+            await this.app.vault.createBinary(audioPath, await file.arrayBuffer());
+        }
+
+        this.statusBarEl?.setText("⏳ Transcribing…");
+        new Notice("Voice Filenote: transcribing, this may take a moment…");
+
+        let transcript: string;
+        try {
+            transcript = await this.transcribeAudio(file);
+        } catch (err) {
+            if (err instanceof QuotaExceededError) {
+                const targetNote = mode === "append" ? (this.app.workspace.getActiveFile()?.path ?? "") : "";
+                await this.createPendingNote(timestamp, file.name, audioPath, mode, targetNote);
+                new Notice("Voice Filenote: Speech quota exceeded. File saved — run 'Retry pending transcriptions' when quota resets.");
+                this.statusBarEl?.setText("");
+                return;
+            }
+            this.statusBarEl?.setText("");
+            throw err;
+        }
+
+        this.statusBarEl?.setText("⏳ Summarising…");
+        const summary = await this.summarise(transcript);
+        this.statusBarEl?.setText("");
+
+        if (mode === "append") {
+            await this.appendToCurrentNote(timestamp, file.name, transcript, summary);
+        } else {
+            await this.createNewNote(timestamp, file.name, transcript, summary);
+        }
+    }
+
+    private async createPendingNote(
+        timestamp: string,
+        audioFilename: string,
+        audioPath: string,
+        mode: RecordingMode,
+        targetNote: string
+    ) {
+        await this.ensureFolder(this.settings.notesFolder);
+        const notePath = `${this.settings.notesFolder}/Voice Note ${timestamp}.md`;
+        const content = `---
+voice_filenote_pending: true
+audio_path: "${audioPath}"
+original_mode: "${mode}"
+target_note: "${targetNote}"
+timestamp: "${timestamp}"
+created: ${timestamp}
+tags:
+  - voice-note
+---
+
+> [!warning] Transcription pending
+> Azure Speech quota was exceeded. The recording has been saved.
+> Run the **Retry pending transcriptions** command once your quota resets.
+
+![[${audioFilename}]]
+`;
+        await this.app.vault.create(notePath, content);
+    }
+
+    private async retryPendingTranscriptions() {
+        const pending = this.app.vault.getMarkdownFiles().filter(f => {
+            const cache = this.app.metadataCache.getFileCache(f);
+            return cache?.frontmatter?.voice_filenote_pending === true;
+        });
+
+        if (pending.length === 0) {
+            new Notice("Voice Filenote: no pending transcriptions found.");
+            return;
+        }
+
+        new Notice(`Voice Filenote: retrying ${pending.length} pending transcription(s)…`);
+
+        for (const stubFile of pending) {
+            const fm = this.app.metadataCache.getFileCache(stubFile)?.frontmatter;
+            if (!fm) continue;
+
+            const audioPath: string = fm.audio_path;
+            const mode: RecordingMode = fm.original_mode;
+            const targetNote: string = fm.target_note ?? "";
+            const timestamp: string = fm.timestamp;
+
+            const audioFile = this.app.vault.getAbstractFileByPath(audioPath);
+            if (!(audioFile instanceof TFile)) {
+                new Notice(`Voice Filenote: audio file not found — ${audioPath}`);
+                continue;
+            }
+
+            try {
+                const audioData = await this.app.vault.readBinary(audioFile);
+                const audioBlob = new Blob([audioData], { type: this.audioMimeType(audioFile.name) });
+                const audioFilename = audioFile.name;
+
+                this.statusBarEl?.setText("⏳ Transcribing…");
+                const transcript = await this.transcribeAudio(audioBlob);
+
+                this.statusBarEl?.setText("⏳ Summarising…");
+                const summary = await this.summarise(transcript);
+
+                if (mode === "append" && targetNote) {
+                    const targetFile = this.app.vault.getAbstractFileByPath(targetNote);
+                    if (targetFile instanceof TFile) {
+                        const existing = await this.app.vault.read(targetFile);
+                        await this.app.vault.modify(
+                            targetFile,
+                            existing.trimEnd() + "\n\n" + this.buildAppendContent(timestamp, audioFilename, transcript, summary)
+                        );
+                        await this.app.vault.delete(stubFile);
+                        new Notice(`Voice Filenote: appended to ${targetFile.basename}.`);
+                        continue;
+                    }
+                }
+
+                await this.app.vault.modify(
+                    stubFile,
+                    this.buildNewNoteContent(timestamp, audioFilename, transcript, summary)
+                );
+                new Notice(`Voice Filenote: transcription complete — ${stubFile.basename}.`);
+            } catch (err) {
+                if (err instanceof QuotaExceededError) {
+                    new Notice("Voice Filenote: quota still exceeded. Try again later.");
+                    break;
+                }
+                new Notice(`Voice Filenote: retry failed for ${stubFile.basename} — ${err.message}`);
+            } finally {
+                this.statusBarEl?.setText("");
+            }
         }
     }
 
@@ -290,6 +467,9 @@ export default class VoiceFilenotePlugin extends Plugin {
             throw: false,
         });
 
+        if (response.status === 429) {
+            throw new QuotaExceededError("Azure Speech");
+        }
         if (response.status < 200 || response.status >= 300) {
             throw new Error(`Speech API error ${response.status}: ${response.text}`);
         }
@@ -341,6 +521,22 @@ export default class VoiceFilenotePlugin extends Plugin {
         return response.json.choices[0].message.content as string;
     }
 
+    private audioMimeType(filename: string): string {
+        const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+        const map: Record<string, string> = {
+            mp3: "audio/mpeg",
+            mp4: "audio/mp4",
+            m4a: "audio/mp4",
+            wav: "audio/wav",
+            ogg: "audio/ogg",
+            webm: "audio/webm",
+            flac: "audio/flac",
+            aac: "audio/aac",
+            wma: "audio/x-ms-wma",
+        };
+        return map[ext] ?? "audio/webm";
+    }
+
     // Constructs a multipart/form-data body manually because requestUrl
     // does not accept FormData objects.
     private async buildMultipartBody(
@@ -350,7 +546,10 @@ export default class VoiceFilenotePlugin extends Plugin {
         const boundary = "VoiceFilenote" + Date.now().toString(36);
         const enc = new TextEncoder();
         const audioData = await audioBlob.arrayBuffer();
-        const mimeType = audioBlob.type || "audio/webm";
+        const filename = audioBlob instanceof File ? audioBlob.name : "recording.webm";
+        const mimeType = (audioBlob instanceof File && audioBlob.type && audioBlob.type !== "application/octet-stream")
+            ? audioBlob.type
+            : this.audioMimeType(filename);
 
         const part1 = enc.encode(
             `--${boundary}\r\n` +
@@ -361,7 +560,7 @@ export default class VoiceFilenotePlugin extends Plugin {
         );
         const part2Head = enc.encode(
             `--${boundary}\r\n` +
-            `Content-Disposition: form-data; name="audio"; filename="recording.webm"\r\n` +
+            `Content-Disposition: form-data; name="audio"; filename="${filename}"\r\n` +
             `Content-Type: ${mimeType}\r\n\r\n`
         );
         const part2Tail = enc.encode(`\r\n--${boundary}--\r\n`);
@@ -584,5 +783,55 @@ class VoiceFilenoteSettingTab extends PluginSettingTab {
                 t.inputEl.rows = 4;
                 t.inputEl.style.width = "100%";
             });
+    }
+}
+
+class AudioFileModal extends Modal {
+    private file: File | null = null;
+    private mode: RecordingMode;
+    private readonly onSubmit: (file: File, mode: RecordingMode) => void;
+
+    constructor(app: App, defaultMode: RecordingMode, onSubmit: (file: File, mode: RecordingMode) => void) {
+        super(app);
+        this.mode = defaultMode;
+        this.onSubmit = onSubmit;
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl("h2", { text: "Transcribe audio file" });
+
+        const fileInput = contentEl.createEl("input");
+        fileInput.type = "file";
+        fileInput.accept = "audio/*,.m4a,.mp3,.wav,.ogg,.webm,.flac,.mp4,.aac";
+        fileInput.style.cssText = "display:block; width:100%; margin-bottom:1em;";
+        fileInput.onchange = () => { this.file = fileInput.files?.[0] ?? null; };
+
+        new Setting(contentEl)
+            .setName("Mode")
+            .addDropdown(dd => {
+                dd.addOption("new", "Create new note");
+                dd.addOption("append", "Append to current note");
+                dd.setValue(this.mode);
+                dd.onChange(v => { this.mode = v as RecordingMode; });
+            });
+
+        new Setting(contentEl)
+            .addButton(btn =>
+                btn.setButtonText("Transcribe")
+                   .setCta()
+                   .onClick(() => {
+                       if (!this.file) {
+                           new Notice("Voice Filenote: please select an audio file.");
+                           return;
+                       }
+                       this.close();
+                       this.onSubmit(this.file, this.mode);
+                   })
+            );
+    }
+
+    onClose() {
+        this.contentEl.empty();
     }
 }
