@@ -12,6 +12,18 @@ import {
 
 type RecordingMode = "new" | "append";
 
+type NoticeLevel = "info" | "warn" | "error";
+
+// Shows a Notice and mirrors it to the console at a matching level, so
+// messages remain visible in Developer Tools after the toast disappears.
+function notify(message: string, level: NoticeLevel = "info", err?: unknown): void {
+    new Notice(message);
+    const detail = err !== undefined ? [message, err] : [message];
+    if (level === "error") console.error("[Voice Filenote]", ...detail);
+    else if (level === "warn") console.warn("[Voice Filenote]", ...detail);
+    else console.log("[Voice Filenote]", ...detail);
+}
+
 class QuotaExceededError extends Error {
     constructor(public readonly api: string) {
         super(`${api} quota exceeded`);
@@ -28,6 +40,8 @@ interface VoiceFilenoteSettings {
     summaryPrompt: string;
     notesFolder: string;
     defaultMode: RecordingMode;
+    enableDiarization: boolean;
+    maxSpeakers: number;
 }
 
 const DEFAULT_SETTINGS: VoiceFilenoteSettings = {
@@ -37,6 +51,8 @@ const DEFAULT_SETTINGS: VoiceFilenoteSettings = {
     openaiKey: "",
     openaiDeployment: "gpt-4o",
     language: "en-AU",
+    enableDiarization: false,
+    maxSpeakers: 4,
     summaryPrompt:
         "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.",
     notesFolder: "Voice Notes",
@@ -85,9 +101,13 @@ export default class VoiceFilenotePlugin extends Plugin {
             id: "transcribe-file",
             name: "Transcribe audio file…",
             callback: () =>
-                new AudioFileModal(this.app, this.settings.defaultMode, (file, mode) =>
-                    this.processAudioFile(file, mode)
-                ).open(),
+                new AudioFileModal(this.app, this.settings.defaultMode, async (file, mode) => {
+                    try {
+                        await this.processAudioFile(file, mode);
+                    } catch (err) {
+                        notify(`Voice Filenote error: ${err.message}`, "error", err);
+                    }
+                }).open(),
         });
 
         this.addCommand({
@@ -122,15 +142,17 @@ export default class VoiceFilenotePlugin extends Plugin {
     private async startRecording(mode: RecordingMode) {
         const { speechKey, openaiKey, openaiEndpoint } = this.settings;
         if (!speechKey || !openaiKey || !openaiEndpoint) {
-            new Notice(
-                "Voice Filenote: please fill in your API keys in Settings before recording."
+            notify(
+                "Voice Filenote: please fill in your API keys in Settings before recording.",
+                "warn"
             );
             return;
         }
 
         if (mode === "append" && !this.app.workspace.getActiveFile()) {
-            new Notice(
-                "Voice Filenote: no note is currently open. Open a note first, or use 'new note' mode."
+            notify(
+                "Voice Filenote: no note is currently open. Open a note first, or use 'new note' mode.",
+                "warn"
             );
             return;
         }
@@ -139,7 +161,7 @@ export default class VoiceFilenotePlugin extends Plugin {
         try {
             stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         } catch (err) {
-            new Notice(`Voice Filenote: microphone access denied — ${err.message}`);
+            notify(`Voice Filenote: microphone access denied — ${err.message}`, "error", err);
             return;
         }
 
@@ -162,7 +184,7 @@ export default class VoiceFilenotePlugin extends Plugin {
         this.isRecording = true;
         this.ribbonIconEl?.addClass("voice-filenote-recording");
         this.statusBarEl?.setText("⏺ Recording…");
-        new Notice("Voice Filenote: recording started.");
+        notify("Voice Filenote: recording started.");
     }
 
     private async stopRecording() {
@@ -176,13 +198,12 @@ export default class VoiceFilenotePlugin extends Plugin {
                 this.isRecording = false;
                 this.ribbonIconEl?.removeClass("voice-filenote-recording");
                 this.statusBarEl?.setText("⏳ Processing…");
-                new Notice("Voice Filenote: recording stopped, processing…");
+                notify("Voice Filenote: recording stopped, processing…");
 
                 try {
                     await this.processRecording(audioBlob, mimeType, this.pendingMode);
                 } catch (err) {
-                    new Notice(`Voice Filenote error: ${err.message}`);
-                    console.error("[Voice Filenote]", err);
+                    notify(`Voice Filenote error: ${err.message}`, "error", err);
                 } finally {
                     this.statusBarEl?.setText("");
                 }
@@ -227,7 +248,10 @@ export default class VoiceFilenotePlugin extends Plugin {
             if (err instanceof QuotaExceededError) {
                 const targetNote = mode === "append" ? (this.app.workspace.getActiveFile()?.path ?? "") : "";
                 await this.createPendingNote(timestamp, audioFilename, audioPath, mode, targetNote);
-                new Notice("Voice Filenote: Speech quota exceeded. Recording saved — run 'Retry pending transcriptions' when quota resets.");
+                notify(
+                    "Voice Filenote: Speech quota exceeded. Recording saved — run 'Retry pending transcriptions' when quota resets.",
+                    "warn"
+                );
                 return;
             }
             throw err;
@@ -260,7 +284,7 @@ export default class VoiceFilenotePlugin extends Plugin {
         }
 
         this.statusBarEl?.setText("⏳ Transcribing…");
-        new Notice("Voice Filenote: transcribing, this may take a moment…");
+        notify("Voice Filenote: transcribing, this may take a moment…");
 
         let transcript: string;
         try {
@@ -269,7 +293,10 @@ export default class VoiceFilenotePlugin extends Plugin {
             if (err instanceof QuotaExceededError) {
                 const targetNote = mode === "append" ? (this.app.workspace.getActiveFile()?.path ?? "") : "";
                 await this.createPendingNote(timestamp, file.name, audioPath, mode, targetNote);
-                new Notice("Voice Filenote: Speech quota exceeded. File saved — run 'Retry pending transcriptions' when quota resets.");
+                notify(
+                    "Voice Filenote: Speech quota exceeded. File saved — run 'Retry pending transcriptions' when quota resets.",
+                    "warn"
+                );
                 this.statusBarEl?.setText("");
                 return;
             }
@@ -324,11 +351,11 @@ tags:
         });
 
         if (pending.length === 0) {
-            new Notice("Voice Filenote: no pending transcriptions found.");
+            notify("Voice Filenote: no pending transcriptions found.");
             return;
         }
 
-        new Notice(`Voice Filenote: retrying ${pending.length} pending transcription(s)…`);
+        notify(`Voice Filenote: retrying ${pending.length} pending transcription(s)…`);
 
         for (const stubFile of pending) {
             const fm = this.app.metadataCache.getFileCache(stubFile)?.frontmatter;
@@ -341,7 +368,7 @@ tags:
 
             const audioFile = this.app.vault.getAbstractFileByPath(audioPath);
             if (!(audioFile instanceof TFile)) {
-                new Notice(`Voice Filenote: audio file not found — ${audioPath}`);
+                notify(`Voice Filenote: audio file not found — ${audioPath}`, "warn");
                 continue;
             }
 
@@ -365,7 +392,7 @@ tags:
                             existing.trimEnd() + "\n\n" + this.buildAppendContent(timestamp, audioFilename, transcript, summary)
                         );
                         await this.app.vault.delete(stubFile);
-                        new Notice(`Voice Filenote: appended to ${targetFile.basename}.`);
+                        notify(`Voice Filenote: appended to ${targetFile.basename}.`);
                         continue;
                     }
                 }
@@ -374,13 +401,13 @@ tags:
                     stubFile,
                     this.buildNewNoteContent(timestamp, audioFilename, transcript, summary)
                 );
-                new Notice(`Voice Filenote: transcription complete — ${stubFile.basename}.`);
+                notify(`Voice Filenote: transcription complete — ${stubFile.basename}.`);
             } catch (err) {
                 if (err instanceof QuotaExceededError) {
-                    new Notice("Voice Filenote: quota still exceeded. Try again later.");
+                    notify("Voice Filenote: quota still exceeded. Try again later.", "warn");
                     break;
                 }
-                new Notice(`Voice Filenote: retry failed for ${stubFile.basename} — ${err.message}`);
+                notify(`Voice Filenote: retry failed for ${stubFile.basename} — ${err.message}`, "error", err);
             } finally {
                 this.statusBarEl?.setText("");
             }
@@ -421,7 +448,7 @@ tags:
         const content = this.buildNewNoteContent(timestamp, audioFilename, transcript, summary);
         const noteFile = await this.app.vault.create(notePath, content);
         await this.app.workspace.getLeaf(false).openFile(noteFile);
-        new Notice("Voice Filenote: new note created.");
+        notify("Voice Filenote: new note created.");
     }
 
     private async appendToCurrentNote(
@@ -443,18 +470,53 @@ tags:
             "\n\n" +
             this.buildAppendContent(timestamp, audioFilename, transcript, summary);
         await this.app.vault.modify(activeFile, appended);
-        new Notice("Voice Filenote: appended to current note.");
+        notify("Voice Filenote: appended to current note.");
     }
 
-    private async transcribeAudio(audioBlob: Blob): Promise<string> {
-        const { speechKey, speechRegion, language } = this.settings;
+    // Azure's fast transcription endpoint rejects request bodies over
+    // 524,288,000 bytes (500 MB). Stay a little under that to leave room
+    // for multipart framing overhead.
+    private static readonly MAX_UPLOAD_BYTES = 523_000_000;
 
-        const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15`;
-        const { body, contentType } = await this.buildMultipartBody(audioBlob, {
+    private async transcribeAudio(audioBlob: Blob): Promise<string> {
+        if (audioBlob.size <= VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+            return this.transcribeChunk(audioBlob);
+        }
+
+        const sizeMb = (audioBlob.size / (1024 * 1024)).toFixed(0);
+        let chunks: Blob[];
+        try {
+            chunks = await this.splitWavForUpload(audioBlob, VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
+        } catch (err) {
+            throw new Error(
+                `File is ${sizeMb} MB, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please compress the audio or split it into shorter files before transcribing.`
+            );
+        }
+
+        notify(`Voice Filenote: file is ${sizeMb} MB — splitting into ${chunks.length} parts for transcription…`);
+
+        const transcripts: string[] = [];
+        for (let i = 0; i < chunks.length; i++) {
+            this.statusBarEl?.setText(`⏳ Transcribing part ${i + 1}/${chunks.length}…`);
+            transcripts.push(await this.transcribeChunk(chunks[i]));
+        }
+        return transcripts.join(" ");
+    }
+
+    private async transcribeChunk(audioBlob: Blob): Promise<string> {
+        const { speechKey, speechRegion, language, enableDiarization, maxSpeakers } = this.settings;
+
+        // api-version 2025-10-15 is required for diarization support.
+        const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15`;
+        const definition: Record<string, unknown> = {
             locales: [language],
             profanityFilterMode: "None",
             channels: [0],
-        });
+        };
+        if (enableDiarization) {
+            definition.diarization = { enabled: true, maxSpeakers };
+        }
+        const { body, contentType } = await this.buildMultipartBody(audioBlob, definition);
 
         const response = await requestUrl({
             url,
@@ -474,12 +536,149 @@ tags:
             throw new Error(`Speech API error ${response.status}: ${response.text}`);
         }
 
-        const data = response.json;
+        return this.formatTranscript(response.json, enableDiarization);
+    }
+
+    // When diarization is on, groups consecutive same-speaker phrases into
+    // labelled paragraphs. Otherwise falls back to the plain merged text.
+    private formatTranscript(data: any, diarization: boolean): string {
+        const phrases: { text: string; speaker?: number }[] = data.phrases ?? [];
+
+        if (diarization && phrases.some((p) => p.speaker !== undefined)) {
+            const paragraphs: string[] = [];
+            let currentSpeaker: number | undefined;
+            let buffer: string[] = [];
+            const flush = () => {
+                if (buffer.length > 0) {
+                    paragraphs.push(`**Speaker ${currentSpeaker}:** ${buffer.join(" ")}`);
+                    buffer = [];
+                }
+            };
+            for (const p of phrases) {
+                if (p.speaker !== currentSpeaker) {
+                    flush();
+                    currentSpeaker = p.speaker;
+                }
+                buffer.push(p.text);
+            }
+            flush();
+            return paragraphs.join("\n\n");
+        }
+
         const combined: { text: string }[] = data.combinedPhrases ?? [];
         if (combined.length > 0) return combined.map((p) => p.text).join(" ");
-
-        const phrases: { text: string }[] = data.phrases ?? [];
         return phrases.map((p) => p.text).join(" ");
+    }
+
+    // Parses a WAV file's fmt/data chunks so it can be split into
+    // independently-playable sub-files without re-encoding.
+    private parseWavHeader(buf: ArrayBuffer): {
+        dataOffset: number;
+        dataLength: number;
+        audioFormat: number;
+        sampleRate: number;
+        channels: number;
+        bitsPerSample: number;
+        blockAlign: number;
+    } {
+        const view = new DataView(buf);
+        if (
+            view.byteLength < 12 ||
+            view.getUint32(0, false) !== 0x52494646 /* "RIFF" */ ||
+            view.getUint32(8, false) !== 0x57415645 /* "WAVE" */
+        ) {
+            throw new Error("not a valid WAV file");
+        }
+
+        let offset = 12;
+        let dataOffset = -1;
+        let dataLength = 0;
+        let audioFormat = 1;
+        let sampleRate = 0;
+        let channels = 0;
+        let bitsPerSample = 0;
+
+        while (offset + 8 <= view.byteLength) {
+            const chunkId = view.getUint32(offset, false);
+            const chunkSize = view.getUint32(offset + 4, true);
+            const chunkBodyOffset = offset + 8;
+
+            if (chunkId === 0x666d7420 /* "fmt " */) {
+                audioFormat = view.getUint16(chunkBodyOffset, true);
+                channels = view.getUint16(chunkBodyOffset + 2, true);
+                sampleRate = view.getUint32(chunkBodyOffset + 4, true);
+                bitsPerSample = view.getUint16(chunkBodyOffset + 14, true);
+            } else if (chunkId === 0x64617461 /* "data" */) {
+                dataOffset = chunkBodyOffset;
+                dataLength = Math.min(chunkSize, view.byteLength - chunkBodyOffset);
+            }
+
+            offset = chunkBodyOffset + chunkSize + (chunkSize % 2);
+        }
+
+        if (dataOffset < 0) throw new Error("WAV file has no data chunk");
+        const blockAlign = channels * (bitsPerSample / 8);
+        return { dataOffset, dataLength, audioFormat, sampleRate, channels, bitsPerSample, blockAlign };
+    }
+
+    private buildWavHeader(
+        dataLength: number,
+        audioFormat: number,
+        sampleRate: number,
+        channels: number,
+        bitsPerSample: number
+    ): ArrayBuffer {
+        const blockAlign = channels * (bitsPerSample / 8);
+        const byteRate = sampleRate * blockAlign;
+        const buf = new ArrayBuffer(44);
+        const view = new DataView(buf);
+        const writeStr = (offset: number, str: string) => {
+            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        };
+
+        writeStr(0, "RIFF");
+        view.setUint32(4, 36 + dataLength, true);
+        writeStr(8, "WAVE");
+        writeStr(12, "fmt ");
+        view.setUint32(16, 16, true);
+        view.setUint16(20, audioFormat, true);
+        view.setUint16(22, channels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        writeStr(36, "data");
+        view.setUint32(40, dataLength, true);
+        return buf;
+    }
+
+    // Splits an oversized WAV file into standalone WAV blobs, each under
+    // maxBytes, cut on sample-block boundaries so no audio frame is corrupted.
+    private async splitWavForUpload(audioBlob: Blob, maxBytes: number): Promise<Blob[]> {
+        const buf = await audioBlob.arrayBuffer();
+        const { dataOffset, dataLength, audioFormat, sampleRate, channels, bitsPerSample, blockAlign } =
+            this.parseWavHeader(buf);
+
+        if (blockAlign <= 0) {
+            throw new Error("could not determine WAV sample format");
+        }
+
+        const maxDataBytesPerChunk = Math.floor((maxBytes - 44) / blockAlign) * blockAlign;
+        if (maxDataBytesPerChunk <= 0) {
+            throw new Error("WAV format parameters prevent chunking within the size limit");
+        }
+
+        const chunks: Blob[] = [];
+        const dataEnd = dataOffset + dataLength;
+        let offset = dataOffset;
+        while (offset < dataEnd) {
+            const chunkDataLength = Math.min(maxDataBytesPerChunk, dataEnd - offset);
+            const header = this.buildWavHeader(chunkDataLength, audioFormat, sampleRate, channels, bitsPerSample);
+            const chunkData = buf.slice(offset, offset + chunkDataLength);
+            chunks.push(new Blob([header, chunkData], { type: "audio/wav" }));
+            offset += chunkDataLength;
+        }
+        return chunks;
     }
 
     private async summarise(transcript: string): Promise<string> {
@@ -712,6 +911,35 @@ class VoiceFilenoteSettingTab extends PluginSettingTab {
                     })
             );
 
+        new Setting(containerEl)
+            .setName("Identify speakers")
+            .setDesc(
+                "Label the transcript by speaker (e.g. 'Speaker 1: …'). Only works on single-channel audio. " +
+                "Note: speaker numbers reset for each part of a file that's split for size, so they may not line up across parts."
+            )
+            .addToggle((t) =>
+                t
+                    .setValue(this.plugin.settings.enableDiarization)
+                    .onChange(async (v) => {
+                        this.plugin.settings.enableDiarization = v;
+                        await this.plugin.saveSettings();
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName("Maximum speakers")
+            .setDesc("Upper bound on the number of distinct speakers to detect (2–35).")
+            .addSlider((s) =>
+                s
+                    .setLimits(2, 35, 1)
+                    .setValue(this.plugin.settings.maxSpeakers)
+                    .setDynamicTooltip()
+                    .onChange(async (v) => {
+                        this.plugin.settings.maxSpeakers = v;
+                        await this.plugin.saveSettings();
+                    })
+            );
+
         // ── OpenAI ──────────────────────────────────────────────────────────
         containerEl.createEl("h3", { text: "Azure OpenAI (summarisation)" });
 
@@ -822,7 +1050,7 @@ class AudioFileModal extends Modal {
                    .setCta()
                    .onClick(() => {
                        if (!this.file) {
-                           new Notice("Voice Filenote: please select an audio file.");
+                           notify("Voice Filenote: please select an audio file.", "warn");
                            return;
                        }
                        this.close();

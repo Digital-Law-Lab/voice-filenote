@@ -23,6 +23,16 @@ __export(main_exports, {
 });
 module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
+function notify(message, level = "info", err) {
+  new import_obsidian.Notice(message);
+  const detail = err !== void 0 ? [message, err] : [message];
+  if (level === "error")
+    console.error("[Voice Filenote]", ...detail);
+  else if (level === "warn")
+    console.warn("[Voice Filenote]", ...detail);
+  else
+    console.log("[Voice Filenote]", ...detail);
+}
 var QuotaExceededError = class extends Error {
   constructor(api) {
     super(`${api} quota exceeded`);
@@ -36,11 +46,13 @@ var DEFAULT_SETTINGS = {
   openaiKey: "",
   openaiDeployment: "gpt-4o",
   language: "en-AU",
+  enableDiarization: false,
+  maxSpeakers: 4,
   summaryPrompt: "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.",
   notesFolder: "Voice Notes",
   defaultMode: "new"
 };
-var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
+var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.mediaRecorder = null;
@@ -76,11 +88,13 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     this.addCommand({
       id: "transcribe-file",
       name: "Transcribe audio file\u2026",
-      callback: () => new AudioFileModal(
-        this.app,
-        this.settings.defaultMode,
-        (file, mode) => this.processAudioFile(file, mode)
-      ).open()
+      callback: () => new AudioFileModal(this.app, this.settings.defaultMode, async (file, mode) => {
+        try {
+          await this.processAudioFile(file, mode);
+        } catch (err) {
+          notify(`Voice Filenote error: ${err.message}`, "error", err);
+        }
+      }).open()
     });
     this.addCommand({
       id: "retry-pending",
@@ -110,14 +124,16 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     var _a, _b, _c;
     const { speechKey, openaiKey, openaiEndpoint } = this.settings;
     if (!speechKey || !openaiKey || !openaiEndpoint) {
-      new import_obsidian.Notice(
-        "Voice Filenote: please fill in your API keys in Settings before recording."
+      notify(
+        "Voice Filenote: please fill in your API keys in Settings before recording.",
+        "warn"
       );
       return;
     }
     if (mode === "append" && !this.app.workspace.getActiveFile()) {
-      new import_obsidian.Notice(
-        "Voice Filenote: no note is currently open. Open a note first, or use 'new note' mode."
+      notify(
+        "Voice Filenote: no note is currently open. Open a note first, or use 'new note' mode.",
+        "warn"
       );
       return;
     }
@@ -125,7 +141,7 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
-      new import_obsidian.Notice(`Voice Filenote: microphone access denied \u2014 ${err.message}`);
+      notify(`Voice Filenote: microphone access denied \u2014 ${err.message}`, "error", err);
       return;
     }
     const mimeType = (_a = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(
@@ -142,7 +158,7 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     this.isRecording = true;
     (_b = this.ribbonIconEl) == null ? void 0 : _b.addClass("voice-filenote-recording");
     (_c = this.statusBarEl) == null ? void 0 : _c.setText("\u23FA Recording\u2026");
-    new import_obsidian.Notice("Voice Filenote: recording started.");
+    notify("Voice Filenote: recording started.");
   }
   async stopRecording() {
     if (!this.mediaRecorder)
@@ -156,12 +172,11 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
         this.isRecording = false;
         (_c = this.ribbonIconEl) == null ? void 0 : _c.removeClass("voice-filenote-recording");
         (_d = this.statusBarEl) == null ? void 0 : _d.setText("\u23F3 Processing\u2026");
-        new import_obsidian.Notice("Voice Filenote: recording stopped, processing\u2026");
+        notify("Voice Filenote: recording stopped, processing\u2026");
         try {
           await this.processRecording(audioBlob, mimeType, this.pendingMode);
         } catch (err) {
-          new import_obsidian.Notice(`Voice Filenote error: ${err.message}`);
-          console.error("[Voice Filenote]", err);
+          notify(`Voice Filenote error: ${err.message}`, "error", err);
         } finally {
           (_e = this.statusBarEl) == null ? void 0 : _e.setText("");
         }
@@ -194,7 +209,10 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       if (err instanceof QuotaExceededError) {
         const targetNote = mode === "append" ? (_e = (_d = this.app.workspace.getActiveFile()) == null ? void 0 : _d.path) != null ? _e : "" : "";
         await this.createPendingNote(timestamp, audioFilename, audioPath, mode, targetNote);
-        new import_obsidian.Notice("Voice Filenote: Speech quota exceeded. Recording saved \u2014 run 'Retry pending transcriptions' when quota resets.");
+        notify(
+          "Voice Filenote: Speech quota exceeded. Recording saved \u2014 run 'Retry pending transcriptions' when quota resets.",
+          "warn"
+        );
         return;
       }
       throw err;
@@ -218,7 +236,7 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       await this.app.vault.createBinary(audioPath, await file.arrayBuffer());
     }
     (_c = this.statusBarEl) == null ? void 0 : _c.setText("\u23F3 Transcribing\u2026");
-    new import_obsidian.Notice("Voice Filenote: transcribing, this may take a moment\u2026");
+    notify("Voice Filenote: transcribing, this may take a moment\u2026");
     let transcript;
     try {
       transcript = await this.transcribeAudio(file);
@@ -226,7 +244,10 @@ var VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       if (err instanceof QuotaExceededError) {
         const targetNote = mode === "append" ? (_e = (_d = this.app.workspace.getActiveFile()) == null ? void 0 : _d.path) != null ? _e : "" : "";
         await this.createPendingNote(timestamp, file.name, audioPath, mode, targetNote);
-        new import_obsidian.Notice("Voice Filenote: Speech quota exceeded. File saved \u2014 run 'Retry pending transcriptions' when quota resets.");
+        notify(
+          "Voice Filenote: Speech quota exceeded. File saved \u2014 run 'Retry pending transcriptions' when quota resets.",
+          "warn"
+        );
         (_f = this.statusBarEl) == null ? void 0 : _f.setText("");
         return;
       }
@@ -272,10 +293,10 @@ tags:
       return ((_a2 = cache == null ? void 0 : cache.frontmatter) == null ? void 0 : _a2.voice_filenote_pending) === true;
     });
     if (pending.length === 0) {
-      new import_obsidian.Notice("Voice Filenote: no pending transcriptions found.");
+      notify("Voice Filenote: no pending transcriptions found.");
       return;
     }
-    new import_obsidian.Notice(`Voice Filenote: retrying ${pending.length} pending transcription(s)\u2026`);
+    notify(`Voice Filenote: retrying ${pending.length} pending transcription(s)\u2026`);
     for (const stubFile of pending) {
       const fm = (_a = this.app.metadataCache.getFileCache(stubFile)) == null ? void 0 : _a.frontmatter;
       if (!fm)
@@ -286,7 +307,7 @@ tags:
       const timestamp = fm.timestamp;
       const audioFile = this.app.vault.getAbstractFileByPath(audioPath);
       if (!(audioFile instanceof import_obsidian.TFile)) {
-        new import_obsidian.Notice(`Voice Filenote: audio file not found \u2014 ${audioPath}`);
+        notify(`Voice Filenote: audio file not found \u2014 ${audioPath}`, "warn");
         continue;
       }
       try {
@@ -306,7 +327,7 @@ tags:
               existing.trimEnd() + "\n\n" + this.buildAppendContent(timestamp, audioFilename, transcript, summary)
             );
             await this.app.vault.delete(stubFile);
-            new import_obsidian.Notice(`Voice Filenote: appended to ${targetFile.basename}.`);
+            notify(`Voice Filenote: appended to ${targetFile.basename}.`);
             continue;
           }
         }
@@ -314,13 +335,13 @@ tags:
           stubFile,
           this.buildNewNoteContent(timestamp, audioFilename, transcript, summary)
         );
-        new import_obsidian.Notice(`Voice Filenote: transcription complete \u2014 ${stubFile.basename}.`);
+        notify(`Voice Filenote: transcription complete \u2014 ${stubFile.basename}.`);
       } catch (err) {
         if (err instanceof QuotaExceededError) {
-          new import_obsidian.Notice("Voice Filenote: quota still exceeded. Try again later.");
+          notify("Voice Filenote: quota still exceeded. Try again later.", "warn");
           break;
         }
-        new import_obsidian.Notice(`Voice Filenote: retry failed for ${stubFile.basename} \u2014 ${err.message}`);
+        notify(`Voice Filenote: retry failed for ${stubFile.basename} \u2014 ${err.message}`, "error", err);
       } finally {
         (_e = this.statusBarEl) == null ? void 0 : _e.setText("");
       }
@@ -350,7 +371,7 @@ tags:
     const content = this.buildNewNoteContent(timestamp, audioFilename, transcript, summary);
     const noteFile = await this.app.vault.create(notePath, content);
     await this.app.workspace.getLeaf(false).openFile(noteFile);
-    new import_obsidian.Notice("Voice Filenote: new note created.");
+    notify("Voice Filenote: new note created.");
   }
   async appendToCurrentNote(timestamp, audioFilename, transcript, summary) {
     const activeFile = this.app.workspace.getActiveFile();
@@ -362,17 +383,42 @@ tags:
     const existing = await this.app.vault.read(activeFile);
     const appended = existing.trimEnd() + "\n\n" + this.buildAppendContent(timestamp, audioFilename, transcript, summary);
     await this.app.vault.modify(activeFile, appended);
-    new import_obsidian.Notice("Voice Filenote: appended to current note.");
+    notify("Voice Filenote: appended to current note.");
   }
   async transcribeAudio(audioBlob) {
-    var _a, _b;
-    const { speechKey, speechRegion, language } = this.settings;
-    const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2024-11-15`;
-    const { body, contentType } = await this.buildMultipartBody(audioBlob, {
+    var _a;
+    if (audioBlob.size <= _VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+      return this.transcribeChunk(audioBlob);
+    }
+    const sizeMb = (audioBlob.size / (1024 * 1024)).toFixed(0);
+    let chunks;
+    try {
+      chunks = await this.splitWavForUpload(audioBlob, _VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
+    } catch (err) {
+      throw new Error(
+        `File is ${sizeMb} MB, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please compress the audio or split it into shorter files before transcribing.`
+      );
+    }
+    notify(`Voice Filenote: file is ${sizeMb} MB \u2014 splitting into ${chunks.length} parts for transcription\u2026`);
+    const transcripts = [];
+    for (let i = 0; i < chunks.length; i++) {
+      (_a = this.statusBarEl) == null ? void 0 : _a.setText(`\u23F3 Transcribing part ${i + 1}/${chunks.length}\u2026`);
+      transcripts.push(await this.transcribeChunk(chunks[i]));
+    }
+    return transcripts.join(" ");
+  }
+  async transcribeChunk(audioBlob) {
+    const { speechKey, speechRegion, language, enableDiarization, maxSpeakers } = this.settings;
+    const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15`;
+    const definition = {
       locales: [language],
       profanityFilterMode: "None",
       channels: [0]
-    });
+    };
+    if (enableDiarization) {
+      definition.diarization = { enabled: true, maxSpeakers };
+    }
+    const { body, contentType } = await this.buildMultipartBody(audioBlob, definition);
     const response = await (0, import_obsidian.requestUrl)({
       url,
       method: "POST",
@@ -389,12 +435,119 @@ tags:
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Speech API error ${response.status}: ${response.text}`);
     }
-    const data = response.json;
-    const combined = (_a = data.combinedPhrases) != null ? _a : [];
+    return this.formatTranscript(response.json, enableDiarization);
+  }
+  // When diarization is on, groups consecutive same-speaker phrases into
+  // labelled paragraphs. Otherwise falls back to the plain merged text.
+  formatTranscript(data, diarization) {
+    var _a, _b;
+    const phrases = (_a = data.phrases) != null ? _a : [];
+    if (diarization && phrases.some((p) => p.speaker !== void 0)) {
+      const paragraphs = [];
+      let currentSpeaker;
+      let buffer = [];
+      const flush = () => {
+        if (buffer.length > 0) {
+          paragraphs.push(`**Speaker ${currentSpeaker}:** ${buffer.join(" ")}`);
+          buffer = [];
+        }
+      };
+      for (const p of phrases) {
+        if (p.speaker !== currentSpeaker) {
+          flush();
+          currentSpeaker = p.speaker;
+        }
+        buffer.push(p.text);
+      }
+      flush();
+      return paragraphs.join("\n\n");
+    }
+    const combined = (_b = data.combinedPhrases) != null ? _b : [];
     if (combined.length > 0)
       return combined.map((p) => p.text).join(" ");
-    const phrases = (_b = data.phrases) != null ? _b : [];
     return phrases.map((p) => p.text).join(" ");
+  }
+  // Parses a WAV file's fmt/data chunks so it can be split into
+  // independently-playable sub-files without re-encoding.
+  parseWavHeader(buf) {
+    const view = new DataView(buf);
+    if (view.byteLength < 12 || view.getUint32(0, false) !== 1380533830 || view.getUint32(8, false) !== 1463899717) {
+      throw new Error("not a valid WAV file");
+    }
+    let offset = 12;
+    let dataOffset = -1;
+    let dataLength = 0;
+    let audioFormat = 1;
+    let sampleRate = 0;
+    let channels = 0;
+    let bitsPerSample = 0;
+    while (offset + 8 <= view.byteLength) {
+      const chunkId = view.getUint32(offset, false);
+      const chunkSize = view.getUint32(offset + 4, true);
+      const chunkBodyOffset = offset + 8;
+      if (chunkId === 1718449184) {
+        audioFormat = view.getUint16(chunkBodyOffset, true);
+        channels = view.getUint16(chunkBodyOffset + 2, true);
+        sampleRate = view.getUint32(chunkBodyOffset + 4, true);
+        bitsPerSample = view.getUint16(chunkBodyOffset + 14, true);
+      } else if (chunkId === 1684108385) {
+        dataOffset = chunkBodyOffset;
+        dataLength = Math.min(chunkSize, view.byteLength - chunkBodyOffset);
+      }
+      offset = chunkBodyOffset + chunkSize + chunkSize % 2;
+    }
+    if (dataOffset < 0)
+      throw new Error("WAV file has no data chunk");
+    const blockAlign = channels * (bitsPerSample / 8);
+    return { dataOffset, dataLength, audioFormat, sampleRate, channels, bitsPerSample, blockAlign };
+  }
+  buildWavHeader(dataLength, audioFormat, sampleRate, channels, bitsPerSample) {
+    const blockAlign = channels * (bitsPerSample / 8);
+    const byteRate = sampleRate * blockAlign;
+    const buf = new ArrayBuffer(44);
+    const view = new DataView(buf);
+    const writeStr = (offset, str) => {
+      for (let i = 0; i < str.length; i++)
+        view.setUint8(offset + i, str.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + dataLength, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, audioFormat, true);
+    view.setUint16(22, channels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, bitsPerSample, true);
+    writeStr(36, "data");
+    view.setUint32(40, dataLength, true);
+    return buf;
+  }
+  // Splits an oversized WAV file into standalone WAV blobs, each under
+  // maxBytes, cut on sample-block boundaries so no audio frame is corrupted.
+  async splitWavForUpload(audioBlob, maxBytes) {
+    const buf = await audioBlob.arrayBuffer();
+    const { dataOffset, dataLength, audioFormat, sampleRate, channels, bitsPerSample, blockAlign } = this.parseWavHeader(buf);
+    if (blockAlign <= 0) {
+      throw new Error("could not determine WAV sample format");
+    }
+    const maxDataBytesPerChunk = Math.floor((maxBytes - 44) / blockAlign) * blockAlign;
+    if (maxDataBytesPerChunk <= 0) {
+      throw new Error("WAV format parameters prevent chunking within the size limit");
+    }
+    const chunks = [];
+    const dataEnd = dataOffset + dataLength;
+    let offset = dataOffset;
+    while (offset < dataEnd) {
+      const chunkDataLength = Math.min(maxDataBytesPerChunk, dataEnd - offset);
+      const header = this.buildWavHeader(chunkDataLength, audioFormat, sampleRate, channels, bitsPerSample);
+      const chunkData = buf.slice(offset, offset + chunkDataLength);
+      chunks.push(new Blob([header, chunkData], { type: "audio/wav" }));
+      offset += chunkDataLength;
+    }
+    return chunks;
   }
   async summarise(transcript) {
     const { openaiEndpoint, openaiKey, openaiDeployment, summaryPrompt } = this.settings;
@@ -533,6 +686,11 @@ ${transcript}
     }
   }
 };
+var VoiceFilenotePlugin = _VoiceFilenotePlugin;
+// Azure's fast transcription endpoint rejects request bodies over
+// 524,288,000 bytes (500 MB). Stay a little under that to leave room
+// for multipart framing overhead.
+VoiceFilenotePlugin.MAX_UPLOAD_BYTES = 523e6;
 var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -567,6 +725,20 @@ var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Language").setDesc("BCP-47 language code (e.g. en-AU, en-US)").addText(
       (t) => t.setPlaceholder("en-AU").setValue(this.plugin.settings.language).onChange(async (v) => {
         this.plugin.settings.language = v.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Identify speakers").setDesc(
+      "Label the transcript by speaker (e.g. 'Speaker 1: \u2026'). Only works on single-channel audio. Note: speaker numbers reset for each part of a file that's split for size, so they may not line up across parts."
+    ).addToggle(
+      (t) => t.setValue(this.plugin.settings.enableDiarization).onChange(async (v) => {
+        this.plugin.settings.enableDiarization = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Maximum speakers").setDesc("Upper bound on the number of distinct speakers to detect (2\u201335).").addSlider(
+      (s) => s.setLimits(2, 35, 1).setValue(this.plugin.settings.maxSpeakers).setDynamicTooltip().onChange(async (v) => {
+        this.plugin.settings.maxSpeakers = v;
         await this.plugin.saveSettings();
       })
     );
@@ -635,7 +807,7 @@ var AudioFileModal = class extends import_obsidian.Modal {
     new import_obsidian.Setting(contentEl).addButton(
       (btn) => btn.setButtonText("Transcribe").setCta().onClick(() => {
         if (!this.file) {
-          new import_obsidian.Notice("Voice Filenote: please select an audio file.");
+          notify("Voice Filenote: please select an audio file.", "warn");
           return;
         }
         this.close();
