@@ -48,6 +48,7 @@ var DEFAULT_SETTINGS = {
   language: "en-AU",
   enableDiarization: false,
   maxSpeakers: 4,
+  promptForSpeakerNames: true,
   summaryPrompt: "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.",
   notesFolder: "Voice Notes",
   defaultMode: "new"
@@ -387,8 +388,11 @@ tags:
   }
   async transcribeAudio(audioBlob) {
     var _a;
+    const { enableDiarization } = this.settings;
     if (audioBlob.size <= _VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
-      return this.transcribeChunk(audioBlob);
+      const { phrases, fallbackText } = await this.transcribeChunk(audioBlob);
+      const names = await this.maybeIdentifySpeakers(audioBlob, phrases);
+      return this.formatTranscript(phrases, fallbackText, enableDiarization, names);
     }
     const sizeMb = (audioBlob.size / (1024 * 1024)).toFixed(0);
     let chunks;
@@ -400,14 +404,22 @@ tags:
       );
     }
     notify(`Voice Filenote: file is ${sizeMb} MB \u2014 splitting into ${chunks.length} parts for transcription\u2026`);
-    const transcripts = [];
+    const parts = [];
     for (let i = 0; i < chunks.length; i++) {
       (_a = this.statusBarEl) == null ? void 0 : _a.setText(`\u23F3 Transcribing part ${i + 1}/${chunks.length}\u2026`);
-      transcripts.push(await this.transcribeChunk(chunks[i]));
+      const { phrases, fallbackText } = await this.transcribeChunk(chunks[i]);
+      const names = await this.maybeIdentifySpeakers(chunks[i], phrases, `Part ${i + 1} of ${chunks.length}`);
+      parts.push(this.formatTranscript(phrases, fallbackText, enableDiarization, names));
     }
-    return transcripts.join(" ");
+    const header = enableDiarization ? `> [!note] This recording was split into ${chunks.length} parts for transcription. Speaker labels are independent per part and may not refer to the same person across parts.
+
+` : "";
+    return header + parts.map((text, i) => `### Part ${i + 1}
+
+${text}`).join("\n\n");
   }
   async transcribeChunk(audioBlob) {
+    var _a, _b;
     const { speechKey, speechRegion, language, enableDiarization, maxSpeakers } = this.settings;
     const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15`;
     const definition = {
@@ -435,20 +447,25 @@ tags:
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Speech API error ${response.status}: ${response.text}`);
     }
-    return this.formatTranscript(response.json, enableDiarization);
+    const data = response.json;
+    const phrases = (_a = data.phrases) != null ? _a : [];
+    const combined = (_b = data.combinedPhrases) != null ? _b : [];
+    const fallbackText = combined.length > 0 ? combined.map((p) => p.text).join(" ") : phrases.map((p) => p.text).join(" ");
+    return { phrases, fallbackText };
   }
   // When diarization is on, groups consecutive same-speaker phrases into
-  // labelled paragraphs. Otherwise falls back to the plain merged text.
-  formatTranscript(data, diarization) {
-    var _a, _b;
-    const phrases = (_a = data.phrases) != null ? _a : [];
+  // labelled paragraphs, substituting user-supplied names where available.
+  // Otherwise falls back to the plain merged text.
+  formatTranscript(phrases, fallbackText, diarization, names = /* @__PURE__ */ new Map()) {
     if (diarization && phrases.some((p) => p.speaker !== void 0)) {
       const paragraphs = [];
       let currentSpeaker;
       let buffer = [];
       const flush = () => {
+        var _a;
         if (buffer.length > 0) {
-          paragraphs.push(`**Speaker ${currentSpeaker}:** ${buffer.join(" ")}`);
+          const label = currentSpeaker !== void 0 ? (_a = names.get(currentSpeaker)) != null ? _a : `Speaker ${currentSpeaker}` : "Speaker";
+          paragraphs.push(`**${label}:** ${buffer.join(" ")}`);
           buffer = [];
         }
       };
@@ -462,10 +479,40 @@ tags:
       flush();
       return paragraphs.join("\n\n");
     }
-    const combined = (_b = data.combinedPhrases) != null ? _b : [];
-    if (combined.length > 0)
-      return combined.map((p) => p.text).join(" ");
-    return phrases.map((p) => p.text).join(" ");
+    return fallbackText;
+  }
+  // Prompts the user to identify each detected speaker (playing a sample
+  // clip and showing a text excerpt), returning a speaker-id -> name map.
+  // No-ops when diarization/prompting is off or fewer than 2 speakers were
+  // detected in this chunk.
+  async maybeIdentifySpeakers(audioBlob, phrases, partLabel) {
+    const { enableDiarization, promptForSpeakerNames } = this.settings;
+    if (!enableDiarization || !promptForSpeakerNames)
+      return /* @__PURE__ */ new Map();
+    const bySpeaker = /* @__PURE__ */ new Map();
+    for (const p of phrases) {
+      if (p.speaker === void 0)
+        continue;
+      const list = bySpeaker.get(p.speaker);
+      if (list)
+        list.push(p);
+      else
+        bySpeaker.set(p.speaker, [p]);
+    }
+    if (bySpeaker.size < 2)
+      return /* @__PURE__ */ new Map();
+    const samples = [...bySpeaker.entries()].sort(([a], [b]) => a - b).map(([speaker, ps]) => {
+      const longest = ps.reduce((a, b) => b.durationMilliseconds > a.durationMilliseconds ? b : a);
+      return {
+        speaker,
+        offsetMs: longest.offsetMilliseconds,
+        durationMs: longest.durationMilliseconds,
+        textSnippet: ps.slice(0, 3).map((p) => p.text).join(" ")
+      };
+    });
+    return new Promise((resolve) => {
+      new SpeakerIdModal(this.app, audioBlob, samples, partLabel, resolve).open();
+    });
   }
   // Parses a WAV file's fmt/data chunks so it can be split into
   // independently-playable sub-files without re-encoding.
@@ -742,6 +789,14 @@ var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    new import_obsidian.Setting(containerEl).setName("Prompt to name speakers").setDesc(
+      "After transcribing, ask you to identify each detected speaker (with a play-sample button) and replace 'Speaker 0/1/\u2026' labels with the names you enter."
+    ).addToggle(
+      (t) => t.setValue(this.plugin.settings.promptForSpeakerNames).onChange(async (v) => {
+        this.plugin.settings.promptForSpeakerNames = v;
+        await this.plugin.saveSettings();
+      })
+    );
     containerEl.createEl("h3", { text: "Azure OpenAI (summarisation)" });
     new import_obsidian.Setting(containerEl).setName("Endpoint").setDesc("Endpoint URL from your Azure OpenAI resource").addText(
       (t) => t.setPlaceholder("https://my-openai.openai.azure.com/").setValue(this.plugin.settings.openaiEndpoint).onChange(async (v) => {
@@ -817,5 +872,68 @@ var AudioFileModal = class extends import_obsidian.Modal {
   }
   onClose() {
     this.contentEl.empty();
+  }
+};
+var SpeakerIdModal = class extends import_obsidian.Modal {
+  constructor(app, audioBlob, samples, partLabel, onDone) {
+    super(app);
+    this.audioBlob = audioBlob;
+    this.samples = samples;
+    this.partLabel = partLabel;
+    this.onDone = onDone;
+    this.names = /* @__PURE__ */ new Map();
+    this.resolved = false;
+  }
+  onOpen() {
+    this.objectUrl = URL.createObjectURL(this.audioBlob);
+    this.audioEl = document.createElement("audio");
+    this.audioEl.src = this.objectUrl;
+    const { contentEl } = this;
+    contentEl.createEl("h2", {
+      text: this.partLabel ? `Identify speakers \u2014 ${this.partLabel}` : "Identify speakers"
+    });
+    contentEl.createEl("p", {
+      text: "Play a sample or read the excerpt to identify each speaker. Leave a name blank to keep the default label."
+    });
+    for (const sample of this.samples) {
+      new import_obsidian.Setting(contentEl).setName(`Speaker ${sample.speaker}`).setDesc(sample.textSnippet).addButton(
+        (btn) => btn.setButtonText("\u25B6 Play").onClick(() => this.playSample(sample))
+      ).addText(
+        (text) => text.setPlaceholder(`Speaker ${sample.speaker}`).onChange((v) => {
+          const trimmed = v.trim();
+          if (trimmed)
+            this.names.set(sample.speaker, trimmed);
+          else
+            this.names.delete(sample.speaker);
+        })
+      );
+    }
+    new import_obsidian.Setting(contentEl).addButton(
+      (btn) => btn.setButtonText("Continue").setCta().onClick(() => this.finish())
+    );
+  }
+  playSample(sample) {
+    window.clearTimeout(this.pauseTimer);
+    this.audioEl.pause();
+    this.audioEl.currentTime = sample.offsetMs / 1e3;
+    void this.audioEl.play();
+    this.pauseTimer = window.setTimeout(() => this.audioEl.pause(), sample.durationMs);
+  }
+  finish() {
+    this.resolved = true;
+    this.close();
+    this.onDone(this.names);
+  }
+  onClose() {
+    var _a;
+    this.contentEl.empty();
+    window.clearTimeout(this.pauseTimer);
+    (_a = this.audioEl) == null ? void 0 : _a.pause();
+    if (this.objectUrl)
+      URL.revokeObjectURL(this.objectUrl);
+    if (!this.resolved) {
+      this.resolved = true;
+      this.onDone(/* @__PURE__ */ new Map());
+    }
   }
 };
