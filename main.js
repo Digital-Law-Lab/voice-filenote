@@ -386,24 +386,55 @@ tags:
     await this.app.vault.modify(activeFile, appended);
     notify("Voice Filenote: appended to current note.");
   }
+  isWav(blob) {
+    var _a;
+    if (blob.type === "audio/wav" || blob.type === "audio/x-wav")
+      return true;
+    if (blob instanceof File) {
+      const ext = (_a = blob.name.split(".").pop()) == null ? void 0 : _a.toLowerCase();
+      return ext === "wav";
+    }
+    return false;
+  }
+  isWebm(blob) {
+    var _a;
+    if (blob.type === "audio/webm" || blob.type === "video/webm")
+      return true;
+    if (blob instanceof File) {
+      return ((_a = blob.name.split(".").pop()) == null ? void 0 : _a.toLowerCase()) === "webm";
+    }
+    return false;
+  }
   async transcribeAudio(audioBlob) {
     var _a;
     const { enableDiarization } = this.settings;
-    if (audioBlob.size <= _VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+    if (this.isWebm(audioBlob)) {
       const { phrases, fallbackText } = await this.transcribeChunk(audioBlob);
       const names = await this.maybeIdentifySpeakers(audioBlob, phrases);
       return this.formatTranscript(phrases, fallbackText, enableDiarization, names);
     }
-    const sizeMb = (audioBlob.size / (1024 * 1024)).toFixed(0);
+    let wavBlob;
+    if (this.isWav(audioBlob)) {
+      wavBlob = audioBlob;
+    } else {
+      notify("Voice Filenote: converting audio to WAV\u2026");
+      wavBlob = await this.transcodeToWav(audioBlob);
+    }
+    if (wavBlob.size <= _VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+      const { phrases, fallbackText } = await this.transcribeChunk(wavBlob);
+      const names = await this.maybeIdentifySpeakers(wavBlob, phrases);
+      return this.formatTranscript(phrases, fallbackText, enableDiarization, names);
+    }
+    const sizeMb = (wavBlob.size / (1024 * 1024)).toFixed(0);
     let chunks;
     try {
-      chunks = await this.splitWavForUpload(audioBlob, _VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
+      chunks = await this.splitWavForUpload(wavBlob, _VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
     } catch (err) {
       throw new Error(
-        `File is ${sizeMb} MB, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please compress the audio or split it into shorter files before transcribing.`
+        `Audio is ${sizeMb} MB as WAV, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please split it into shorter files before transcribing.`
       );
     }
-    notify(`Voice Filenote: file is ${sizeMb} MB \u2014 splitting into ${chunks.length} parts for transcription\u2026`);
+    notify(`Voice Filenote: audio is ${sizeMb} MB as WAV \u2014 splitting into ${chunks.length} parts for transcription\u2026`);
     const parts = [];
     for (let i = 0; i < chunks.length; i++) {
       (_a = this.statusBarEl) == null ? void 0 : _a.setText(`\u23F3 Transcribing part ${i + 1}/${chunks.length}\u2026`);

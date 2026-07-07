@@ -498,26 +498,61 @@ tags:
     // for multipart framing overhead.
     private static readonly MAX_UPLOAD_BYTES = 523_000_000;
 
+    private isWav(blob: Blob): boolean {
+        if (blob.type === "audio/wav" || blob.type === "audio/x-wav") return true;
+        if (blob instanceof File) {
+            const ext = blob.name.split(".").pop()?.toLowerCase();
+            return ext === "wav";
+        }
+        return false;
+    }
+
+    private isWebm(blob: Blob): boolean {
+        if (blob.type === "audio/webm" || blob.type === "video/webm") return true;
+        if (blob instanceof File) {
+            return blob.name.split(".").pop()?.toLowerCase() === "webm";
+        }
+        return false;
+    }
+
     private async transcribeAudio(audioBlob: Blob): Promise<string> {
         const { enableDiarization } = this.settings;
 
-        if (audioBlob.size <= VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+        // WebM (browser recordings) goes straight to Azure — it's always small and
+        // Azure handles it reliably. The 422 retry in transcribeChunk is the safety net.
+        if (this.isWebm(audioBlob)) {
             const { phrases, fallbackText } = await this.transcribeChunk(audioBlob);
             const names = await this.maybeIdentifySpeakers(audioBlob, phrases);
             return this.formatTranscript(phrases, fallbackText, enableDiarization, names);
         }
 
-        const sizeMb = (audioBlob.size / (1024 * 1024)).toFixed(0);
+        // For everything else, normalise to WAV so we can inspect the uncompressed
+        // size and split if needed.
+        let wavBlob: Blob;
+        if (this.isWav(audioBlob)) {
+            wavBlob = audioBlob;
+        } else {
+            notify("Voice Filenote: converting audio to WAV…");
+            wavBlob = await this.transcodeToWav(audioBlob);
+        }
+
+        if (wavBlob.size <= VoiceFilenotePlugin.MAX_UPLOAD_BYTES) {
+            const { phrases, fallbackText } = await this.transcribeChunk(wavBlob);
+            const names = await this.maybeIdentifySpeakers(wavBlob, phrases);
+            return this.formatTranscript(phrases, fallbackText, enableDiarization, names);
+        }
+
+        const sizeMb = (wavBlob.size / (1024 * 1024)).toFixed(0);
         let chunks: Blob[];
         try {
-            chunks = await this.splitWavForUpload(audioBlob, VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
+            chunks = await this.splitWavForUpload(wavBlob, VoiceFilenotePlugin.MAX_UPLOAD_BYTES);
         } catch (err) {
             throw new Error(
-                `File is ${sizeMb} MB, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please compress the audio or split it into shorter files before transcribing.`
+                `Audio is ${sizeMb} MB as WAV, which exceeds Azure Speech's 500 MB request limit, and it could not be split automatically (${err.message}). Please split it into shorter files before transcribing.`
             );
         }
 
-        notify(`Voice Filenote: file is ${sizeMb} MB — splitting into ${chunks.length} parts for transcription…`);
+        notify(`Voice Filenote: audio is ${sizeMb} MB as WAV — splitting into ${chunks.length} parts for transcription…`);
 
         const parts: string[] = [];
         for (let i = 0; i < chunks.length; i++) {
