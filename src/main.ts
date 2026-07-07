@@ -533,7 +533,10 @@ tags:
         return header + parts.map((text, i) => `### Part ${i + 1}\n\n${text}`).join("\n\n");
     }
 
-    private async transcribeChunk(audioBlob: Blob): Promise<{ phrases: DiarizedPhrase[]; fallbackText: string }> {
+    private async transcribeChunk(
+        audioBlob: Blob,
+        isRetryAfterTranscode = false
+    ): Promise<{ phrases: DiarizedPhrase[]; fallbackText: string }> {
         const { speechKey, speechRegion, language, enableDiarization, maxSpeakers } = this.settings;
 
         // api-version 2025-10-15 is required for diarization support.
@@ -562,6 +565,17 @@ tags:
         if (response.status === 429) {
             throw new QuotaExceededError("Azure Speech");
         }
+
+        // Some recorders (notably Samsung/Android call-recorder apps) write audio
+        // as MP4/AAC but brand the container "3gp4" instead of a standard M4A/isom
+        // brand. Browsers and ffmpeg decode these fine, but Azure's decoder rejects
+        // them outright. Re-encode client-side to a plain PCM WAV and retry once.
+        if (response.status === 422 && !isRetryAfterTranscode && response.json?.innerError?.code === "InvalidAudioFormat") {
+            notify("Voice Filenote: Azure couldn't decode this audio's container — converting to WAV and retrying…", "warn");
+            const wavBlob = await this.transcodeToWav(audioBlob);
+            return this.transcribeChunk(wavBlob, true);
+        }
+
         if (response.status < 200 || response.status >= 300) {
             throw new Error(`Speech API error ${response.status}: ${response.text}`);
         }
@@ -574,6 +588,43 @@ tags:
             : phrases.map((p) => p.text).join(" ");
 
         return { phrases, fallbackText };
+    }
+
+    // Decodes arbitrary audio via the Web Audio API and re-encodes it as a
+    // 16 kHz mono 16-bit PCM WAV — a format Azure's fast-transcription
+    // decoder reliably accepts, used as a fallback when the original
+    // container is rejected outright.
+    private async transcodeToWav(blob: Blob): Promise<Blob> {
+        const arrayBuffer = await blob.arrayBuffer();
+        const audioCtx = new AudioContext();
+        let decoded: AudioBuffer;
+        try {
+            decoded = await audioCtx.decodeAudioData(arrayBuffer);
+        } finally {
+            await audioCtx.close();
+        }
+
+        const targetSampleRate = 16000;
+        const offlineCtx = new OfflineAudioContext(
+            1,
+            Math.ceil(decoded.duration * targetSampleRate),
+            targetSampleRate
+        );
+        const source = offlineCtx.createBufferSource();
+        source.buffer = decoded;
+        source.connect(offlineCtx.destination);
+        source.start();
+        const rendered = await offlineCtx.startRendering();
+
+        const samples = rendered.getChannelData(0);
+        const pcm = new Int16Array(samples.length);
+        for (let i = 0; i < samples.length; i++) {
+            const s = Math.max(-1, Math.min(1, samples[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+
+        const header = this.buildWavHeader(pcm.byteLength, 1, targetSampleRate, 1, 16);
+        return new Blob([header, pcm.buffer], { type: "audio/wav" });
     }
 
     // When diarization is on, groups consecutive same-speaker phrases into

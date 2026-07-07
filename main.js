@@ -418,8 +418,8 @@ tags:
 
 ${text}`).join("\n\n");
   }
-  async transcribeChunk(audioBlob) {
-    var _a, _b;
+  async transcribeChunk(audioBlob, isRetryAfterTranscode = false) {
+    var _a, _b, _c, _d;
     const { speechKey, speechRegion, language, enableDiarization, maxSpeakers } = this.settings;
     const url = `https://${speechRegion}.api.cognitive.microsoft.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15`;
     const definition = {
@@ -444,14 +444,52 @@ ${text}`).join("\n\n");
     if (response.status === 429) {
       throw new QuotaExceededError("Azure Speech");
     }
+    if (response.status === 422 && !isRetryAfterTranscode && ((_b = (_a = response.json) == null ? void 0 : _a.innerError) == null ? void 0 : _b.code) === "InvalidAudioFormat") {
+      notify("Voice Filenote: Azure couldn't decode this audio's container \u2014 converting to WAV and retrying\u2026", "warn");
+      const wavBlob = await this.transcodeToWav(audioBlob);
+      return this.transcribeChunk(wavBlob, true);
+    }
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Speech API error ${response.status}: ${response.text}`);
     }
     const data = response.json;
-    const phrases = (_a = data.phrases) != null ? _a : [];
-    const combined = (_b = data.combinedPhrases) != null ? _b : [];
+    const phrases = (_c = data.phrases) != null ? _c : [];
+    const combined = (_d = data.combinedPhrases) != null ? _d : [];
     const fallbackText = combined.length > 0 ? combined.map((p) => p.text).join(" ") : phrases.map((p) => p.text).join(" ");
     return { phrases, fallbackText };
+  }
+  // Decodes arbitrary audio via the Web Audio API and re-encodes it as a
+  // 16 kHz mono 16-bit PCM WAV — a format Azure's fast-transcription
+  // decoder reliably accepts, used as a fallback when the original
+  // container is rejected outright.
+  async transcodeToWav(blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new AudioContext();
+    let decoded;
+    try {
+      decoded = await audioCtx.decodeAudioData(arrayBuffer);
+    } finally {
+      await audioCtx.close();
+    }
+    const targetSampleRate = 16e3;
+    const offlineCtx = new OfflineAudioContext(
+      1,
+      Math.ceil(decoded.duration * targetSampleRate),
+      targetSampleRate
+    );
+    const source = offlineCtx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offlineCtx.destination);
+    source.start();
+    const rendered = await offlineCtx.startRendering();
+    const samples = rendered.getChannelData(0);
+    const pcm = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      pcm[i] = s < 0 ? s * 32768 : s * 32767;
+    }
+    const header = this.buildWavHeader(pcm.byteLength, 1, targetSampleRate, 1, 16);
+    return new Blob([header, pcm.buffer], { type: "audio/wav" });
   }
   // When diarization is on, groups consecutive same-speaker phrases into
   // labelled paragraphs, substituting user-supplied names where available.
