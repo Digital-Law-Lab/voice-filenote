@@ -63,6 +63,62 @@ interface VoiceFilenoteSettings {
     promptForSpeakerNames: boolean;
 }
 
+// Background passed to the summariser so it can place the recording: when it
+// was made, which note (and so usually which matter) it belongs to, and the
+// uploaded file's name, which often describes the meeting.
+interface SummaryContext {
+    processedAt: string;
+    notePath?: string;
+    sourceFilename?: string;
+    fileModified?: string;
+}
+
+// The summary prompt shipped before structured summaries. Vaults that still
+// have it saved get it cleared on load, since the structure now lives in
+// SUMMARY_SYSTEM_PROMPT and the setting only holds extra instructions.
+const LEGACY_SUMMARY_PROMPT =
+    "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.";
+
+const SUMMARY_SYSTEM_PROMPT = `You summarise voice recordings for an Australian legal practitioner. Your summary is saved into their notes and may later be relied on as a file note, so accuracy matters more than polish.
+
+First decide what kind of recording this is:
+- A conversation (meeting, phone call, conference) with two or more people → write a FILE NOTE.
+- One person speaking (dictation, notes to self, thinking aloud) → write a DICTATION SUMMARY.
+
+FILE NOTE — use these markdown sections, omitting any that would be empty:
+### Attendees
+Each person and, where it is clear, their role or relationship to the matter. Use the speaker names exactly as they appear in the transcript. If a speaker is unnamed (e.g. "Speaker 2"), keep that label and add who they appear to be only if the transcript makes it clear.
+### Purpose
+One or two sentences: what the conversation was about and which matter or client it relates to.
+### Facts and instructions
+What the client or other party told the practitioner, and any instructions given. Attribute each point to who said it.
+### Advice given
+Advice, opinions or recommendations the practitioner gave. Keep this separate from facts and instructions.
+### Action items
+A checklist ("- [ ] ...") with who is responsible and any due date mentioned.
+### Key details
+Dates, deadlines, amounts, names, addresses, reference or file numbers mentioned.
+### To check
+Anything unclear, inaudible, contradictory, or likely mis-transcribed.
+
+DICTATION SUMMARY — use these sections, omitting any that would be empty:
+### Summary
+The main points, in the speaker's own framing.
+### Action items
+As above.
+### Key details
+As above.
+### To check
+As above.
+
+Rules:
+- Use only what is in the transcript. Never fill gaps with assumptions, and never invent names, dates, amounts or outcomes.
+- Keep relative dates as spoken ("end of the week", "next Tuesday"). Don't convert them into calendar dates.
+- The transcript is machine-generated. Names and legal terms are often mis-heard (e.g. a surname transcribed as ordinary words). If something looks like a mis-transcription, keep it as transcribed and list it under To check with your best guess, rather than silently correcting it.
+- If the transcript is split into Parts, speaker labels such as "Speaker 1" are assigned separately in each part and may not be the same person across parts. Don't merge them unless the content makes it clear.
+- Scale the length to the recording: a two-minute note needs a few lines, an hour-long meeting may need a page. Don't pad.
+- Use Australian English and markdown. Start directly with the first section heading. Don't write a title, a preamble, or the format name ("FILE NOTE" or "DICTATION SUMMARY").`;
+
 const DEFAULT_SETTINGS: VoiceFilenoteSettings = {
     speechKey: "",
     speechRegion: "australiaeast",
@@ -73,8 +129,7 @@ const DEFAULT_SETTINGS: VoiceFilenoteSettings = {
     enableDiarization: false,
     maxSpeakers: 4,
     promptForSpeakerNames: true,
-    summaryPrompt:
-        "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.",
+    summaryPrompt: "",
     notesFolder: "Voice Notes",
     defaultMode: "new",
 };
@@ -136,6 +191,12 @@ export default class VoiceFilenotePlugin extends Plugin {
             callback: () => this.retryPendingTranscriptions(),
         });
 
+        this.addCommand({
+            id: "retry-failed-summaries",
+            name: "Retry failed summaries",
+            callback: () => this.retryFailedSummaries(),
+        });
+
         this.addSettingTab(new VoiceFilenoteSettingTab(this.app, this));
     }
 
@@ -145,6 +206,10 @@ export default class VoiceFilenotePlugin extends Plugin {
 
     async loadSettings() {
         this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        if (this.settings.summaryPrompt.trim() === LEGACY_SUMMARY_PROMPT) {
+            this.settings.summaryPrompt = "";
+            await this.saveSettings();
+        }
     }
 
     async saveSettings() {
@@ -278,7 +343,10 @@ export default class VoiceFilenotePlugin extends Plugin {
         }
 
         this.statusBarEl?.setText("⏳ Summarising…");
-        const summary = await this.summarise(transcript);
+        const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+            processedAt: timestamp,
+            notePath: mode === "append" ? refNotePath : undefined,
+        });
 
         if (mode === "append") {
             await this.appendToCurrentNote(timestamp, audioFilename, transcript, summary);
@@ -325,7 +393,12 @@ export default class VoiceFilenotePlugin extends Plugin {
         }
 
         this.statusBarEl?.setText("⏳ Summarising…");
-        const summary = await this.summarise(transcript);
+        const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+            processedAt: timestamp,
+            notePath: mode === "append" ? refNotePath : undefined,
+            sourceFilename: file.name,
+            fileModified: file.lastModified ? moment(file.lastModified).format("YYYY-MM-DD HH:mm") : undefined,
+        });
         this.statusBarEl?.setText("");
 
         if (mode === "append") {
@@ -401,7 +474,11 @@ tags:
                 const transcript = await this.transcribeAudio(audioBlob);
 
                 this.statusBarEl?.setText("⏳ Summarising…");
-                const summary = await this.summarise(transcript);
+                const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+                    processedAt: timestamp,
+                    notePath: mode === "append" && targetNote ? targetNote : undefined,
+                    sourceFilename: audioFilename,
+                });
 
                 if (mode === "append" && targetNote) {
                     const targetFile = this.app.vault.getAbstractFileByPath(targetNote);
@@ -847,43 +924,179 @@ tags:
         return chunks;
     }
 
-    private async summarise(transcript: string): Promise<string> {
+    // A ceiling, not a target: the prompt asks for length proportional to the
+    // recording. Reasoning models (GPT-5 onwards) spend part of this budget on
+    // hidden reasoning before writing, so it's set well above a long file note.
+    private static readonly SUMMARY_MAX_TOKENS = 16384;
+
+    private async summarise(transcript: string, context: SummaryContext): Promise<string> {
         const { openaiEndpoint, openaiKey, openaiDeployment, summaryPrompt } =
             this.settings;
 
         const base = openaiEndpoint.replace(/\/$/, "");
-        const url = `${base}/openai/deployments/${openaiDeployment}/chat/completions?api-version=2024-08-01-preview`;
+        const url = `${base}/openai/deployments/${openaiDeployment}/chat/completions?api-version=2024-10-21`;
 
-        const response = await requestUrl({
-            url,
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "api-key": openaiKey,
-            },
-            body: JSON.stringify({
-                messages: [
-                    {
-                        role: "system",
-                        content:
-                            "You are a helpful assistant that summarises voice note transcripts for a legal practitioner. Be concise and use markdown formatting.",
-                    },
-                    {
-                        role: "user",
-                        content: `${summaryPrompt}\n\n${transcript}`,
-                    },
-                ],
-                temperature: 0.3,
-                max_tokens: 600,
-            }),
-            throw: false,
-        });
+        const contextLines = [`- Processed: ${context.processedAt}`];
+        if (context.fileModified) contextLines.push(`- Audio file last modified (usually close to when it was recorded): ${context.fileModified}`);
+        if (context.sourceFilename) contextLines.push(`- Audio file name: ${context.sourceFilename}`);
+        if (context.notePath) contextLines.push(`- Being added to the note: ${context.notePath} (the folder and title usually identify the matter or client)`);
+
+        const extra = summaryPrompt.trim();
+        const userContent = [
+            "Context:",
+            ...contextLines,
+            ...(extra ? ["", `Additional instructions: ${extra}`] : []),
+            "",
+            "Transcript:",
+            "",
+            transcript,
+        ].join("\n");
+
+        // max_completion_tokens works for GPT-4o and newer models alike, but
+        // reasoning models reject any non-default temperature, so retry without
+        // it if the deployment says it's unsupported.
+        const send = (withTemperature: boolean) =>
+            requestUrl({
+                url,
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "api-key": openaiKey,
+                },
+                body: JSON.stringify({
+                    messages: [
+                        { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+                        { role: "user", content: userContent },
+                    ],
+                    ...(withTemperature ? { temperature: 0.2 } : {}),
+                    max_completion_tokens: VoiceFilenotePlugin.SUMMARY_MAX_TOKENS,
+                }),
+                throw: false,
+            });
+
+        let response = await send(true);
+        if (response.status === 400 && /temperature/i.test(response.text)) {
+            response = await send(false);
+        }
 
         if (response.status < 200 || response.status >= 300) {
             throw new Error(`OpenAI API error ${response.status}: ${response.text}`);
         }
 
-        return response.json.choices[0].message.content as string;
+        const choice = response.json.choices?.[0];
+        const content = (choice?.message?.content as string | undefined)?.trim();
+        if (!content) {
+            throw new Error(`OpenAI returned an empty summary (finish_reason: ${choice?.finish_reason ?? "unknown"})`);
+        }
+        if (choice.finish_reason === "length") {
+            return content + "\n\n> [!warning] Summary cut off\n> The summary hit the length limit and is incomplete. Check the transcript for anything after this point.";
+        }
+        return content;
+    }
+
+    // Shifts the summary's markdown headings so its top level sits directly
+    // under the note's own Summary heading (## in new notes, ### when appended).
+    private nestHeadings(markdown: string, topLevel: number): string {
+        const levels = [...markdown.matchAll(/^(#{1,6}) /gm)].map((m) => m[1].length);
+        if (levels.length === 0) return markdown;
+        const shift = topLevel - Math.min(...levels);
+        return markdown.replace(/^(#{1,6}) /gm, (_, h: string) => "#".repeat(Math.min(6, Math.max(1, h.length + shift))) + " ");
+    }
+
+    private static readonly SUMMARY_FAILED_START = "<!-- voice-filenote:summary-failed -->";
+    private static readonly SUMMARY_FAILED_END = "<!-- /voice-filenote:summary-failed -->";
+
+    // Never lets a summary failure lose the transcript: on error, returns a
+    // placeholder that the "Retry failed summaries" command can find later.
+    private async summariseOrPlaceholder(
+        transcript: string,
+        timestamp: string,
+        context: SummaryContext
+    ): Promise<string> {
+        try {
+            return await this.summarise(transcript, context);
+        } catch (err) {
+            notify(
+                `Voice Filenote: summary failed (${err.message}). Transcript saved — run 'Retry failed summaries' to try again.`,
+                "error",
+                err
+            );
+            return this.summaryFailedPlaceholder(timestamp, err.message);
+        }
+    }
+
+    private summaryFailedPlaceholder(timestamp: string, reason: string): string {
+        const oneLine = reason.replace(/\s+/g, " ").slice(0, 300);
+        return `${VoiceFilenotePlugin.SUMMARY_FAILED_START}
+> [!warning] Summary failed
+> Voice note ${timestamp}. The summary couldn't be generated: ${oneLine}
+> The transcript below is complete. Run **Retry failed summaries** to try again.
+${VoiceFilenotePlugin.SUMMARY_FAILED_END}`;
+    }
+
+    // Finds summary-failed placeholders across the vault and regenerates each
+    // summary from the transcript section that follows it in the same note.
+    private async retryFailedSummaries() {
+        const { SUMMARY_FAILED_START: START, SUMMARY_FAILED_END: END } = VoiceFilenotePlugin;
+        const files: TFile[] = [];
+        for (const f of this.app.vault.getMarkdownFiles()) {
+            if ((await this.app.vault.cachedRead(f)).includes(START)) files.push(f);
+        }
+
+        if (files.length === 0) {
+            notify("Voice Filenote: no failed summaries found.");
+            return;
+        }
+
+        notify(`Voice Filenote: retrying failed summaries in ${files.length} note(s)…`);
+        let fixed = 0;
+        let failed = 0;
+
+        for (const file of files) {
+            let content = await this.app.vault.read(file);
+            let searchFrom = 0;
+            while (true) {
+                const start = content.indexOf(START, searchFrom);
+                if (start < 0) break;
+                const endMarker = content.indexOf(END, start);
+                if (endMarker < 0) break;
+                const end = endMarker + END.length;
+
+                const block = content.slice(start, end);
+                const timestamp = block.match(/Voice note (\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})/)?.[1] ?? "";
+                const rest = content.slice(end);
+                const transcriptMatch = rest.match(/^#{2,3} Transcript\n([\s\S]*?)(?=^#{2,3} Recording\b)/m);
+                if (!transcriptMatch || !transcriptMatch[1].trim()) {
+                    notify(`Voice Filenote: couldn't find the transcript after a failed summary in ${file.basename} — skipped.`, "warn");
+                    failed++;
+                    searchFrom = end;
+                    continue;
+                }
+
+                this.statusBarEl?.setText("⏳ Summarising…");
+                try {
+                    const isVoiceNote = file.path.startsWith(`${this.settings.notesFolder}/`);
+                    const summary = await this.summarise(transcriptMatch[1].trim(), {
+                        processedAt: timestamp || moment().format("YYYY-MM-DD HH-mm-ss"),
+                        notePath: isVoiceNote ? undefined : file.path,
+                    });
+                    const summaryHeading = [...content.slice(0, start).matchAll(/^(#{2,3}) Summary$/gm)].pop();
+                    const nested = this.nestHeadings(summary, (summaryHeading?.[1].length ?? 2) + 1);
+                    content = content.slice(0, start) + nested + content.slice(end);
+                    await this.app.vault.modify(file, content);
+                    searchFrom = start + nested.length;
+                    fixed++;
+                } catch (err) {
+                    notify(`Voice Filenote: summary still failing for ${file.basename} — ${err.message}`, "error", err);
+                    failed++;
+                    searchFrom = end;
+                } finally {
+                    this.statusBarEl?.setText("");
+                }
+            }
+        }
+
+        notify(`Voice Filenote: ${fixed} summar${fixed === 1 ? "y" : "ies"} regenerated${failed ? `, ${failed} still failing` : ""}.`);
     }
 
     private audioMimeType(filename: string): string {
@@ -960,7 +1173,7 @@ tags:
 
 ## Summary
 
-${summary}
+${this.nestHeadings(summary, 3)}
 
 ## Transcript
 
@@ -984,7 +1197,7 @@ ${transcript}
 
 ### Summary
 
-${summary}
+${this.nestHeadings(summary, 4)}
 
 ### Transcript
 
@@ -1152,7 +1365,7 @@ class VoiceFilenoteSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Deployment name")
-            .setDesc("The name you gave the GPT-4o deployment")
+            .setDesc("The name you gave the model deployment, e.g. gpt-4o")
             .addText((t) =>
                 t
                     .setPlaceholder("gpt-4o")
@@ -1180,10 +1393,10 @@ class VoiceFilenoteSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
-            .setName("Summary prompt")
-            .setDesc("Instruction sent to GPT-4o along with the transcript")
+            .setName("Additional summary instructions")
+            .setDesc("Optional. Added to the built-in file-note instructions, e.g. \"Always note any limitation dates mentioned.\" Leave blank to use the built-in instructions alone.")
             .addTextArea((t) => {
-                t.setPlaceholder("Provide a concise summary…")
+                t.setPlaceholder("Optional extra instructions…")
                     .setValue(this.plugin.settings.summaryPrompt)
                     .onChange(async (v) => {
                         this.plugin.settings.summaryPrompt = v;

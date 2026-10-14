@@ -39,6 +39,46 @@ var QuotaExceededError = class extends Error {
     this.api = api;
   }
 };
+var LEGACY_SUMMARY_PROMPT = "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.";
+var SUMMARY_SYSTEM_PROMPT = `You summarise voice recordings for an Australian legal practitioner. Your summary is saved into their notes and may later be relied on as a file note, so accuracy matters more than polish.
+
+First decide what kind of recording this is:
+- A conversation (meeting, phone call, conference) with two or more people \u2192 write a FILE NOTE.
+- One person speaking (dictation, notes to self, thinking aloud) \u2192 write a DICTATION SUMMARY.
+
+FILE NOTE \u2014 use these markdown sections, omitting any that would be empty:
+### Attendees
+Each person and, where it is clear, their role or relationship to the matter. Use the speaker names exactly as they appear in the transcript. If a speaker is unnamed (e.g. "Speaker 2"), keep that label and add who they appear to be only if the transcript makes it clear.
+### Purpose
+One or two sentences: what the conversation was about and which matter or client it relates to.
+### Facts and instructions
+What the client or other party told the practitioner, and any instructions given. Attribute each point to who said it.
+### Advice given
+Advice, opinions or recommendations the practitioner gave. Keep this separate from facts and instructions.
+### Action items
+A checklist ("- [ ] ...") with who is responsible and any due date mentioned.
+### Key details
+Dates, deadlines, amounts, names, addresses, reference or file numbers mentioned.
+### To check
+Anything unclear, inaudible, contradictory, or likely mis-transcribed.
+
+DICTATION SUMMARY \u2014 use these sections, omitting any that would be empty:
+### Summary
+The main points, in the speaker's own framing.
+### Action items
+As above.
+### Key details
+As above.
+### To check
+As above.
+
+Rules:
+- Use only what is in the transcript. Never fill gaps with assumptions, and never invent names, dates, amounts or outcomes.
+- Keep relative dates as spoken ("end of the week", "next Tuesday"). Don't convert them into calendar dates.
+- The transcript is machine-generated. Names and legal terms are often mis-heard (e.g. a surname transcribed as ordinary words). If something looks like a mis-transcription, keep it as transcribed and list it under To check with your best guess, rather than silently correcting it.
+- If the transcript is split into Parts, speaker labels such as "Speaker 1" are assigned separately in each part and may not be the same person across parts. Don't merge them unless the content makes it clear.
+- Scale the length to the recording: a two-minute note needs a few lines, an hour-long meeting may need a page. Don't pad.
+- Use Australian English and markdown. Start directly with the first section heading. Don't write a title, a preamble, or the format name ("FILE NOTE" or "DICTATION SUMMARY").`;
 var DEFAULT_SETTINGS = {
   speechKey: "",
   speechRegion: "australiaeast",
@@ -49,7 +89,7 @@ var DEFAULT_SETTINGS = {
   enableDiarization: false,
   maxSpeakers: 4,
   promptForSpeakerNames: true,
-  summaryPrompt: "Provide a concise summary of the following voice note transcript. Highlight key points and any action items.",
+  summaryPrompt: "",
   notesFolder: "Voice Notes",
   defaultMode: "new"
 };
@@ -102,6 +142,11 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       name: "Retry pending transcriptions",
       callback: () => this.retryPendingTranscriptions()
     });
+    this.addCommand({
+      id: "retry-failed-summaries",
+      name: "Retry failed summaries",
+      callback: () => this.retryFailedSummaries()
+    });
     this.addSettingTab(new VoiceFilenoteSettingTab(this.app, this));
   }
   onunload() {
@@ -110,6 +155,10 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    if (this.settings.summaryPrompt.trim() === LEGACY_SUMMARY_PROMPT) {
+      this.settings.summaryPrompt = "";
+      await this.saveSettings();
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -219,7 +268,10 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       throw err;
     }
     (_f = this.statusBarEl) == null ? void 0 : _f.setText("\u23F3 Summarising\u2026");
-    const summary = await this.summarise(transcript);
+    const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+      processedAt: timestamp,
+      notePath: mode === "append" ? refNotePath : void 0
+    });
     if (mode === "append") {
       await this.appendToCurrentNote(timestamp, audioFilename, transcript, summary);
     } else {
@@ -256,7 +308,12 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       throw err;
     }
     (_h = this.statusBarEl) == null ? void 0 : _h.setText("\u23F3 Summarising\u2026");
-    const summary = await this.summarise(transcript);
+    const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+      processedAt: timestamp,
+      notePath: mode === "append" ? refNotePath : void 0,
+      sourceFilename: file.name,
+      fileModified: file.lastModified ? (0, import_obsidian.moment)(file.lastModified).format("YYYY-MM-DD HH:mm") : void 0
+    });
     (_i = this.statusBarEl) == null ? void 0 : _i.setText("");
     if (mode === "append") {
       await this.appendToCurrentNote(timestamp, file.name, transcript, summary);
@@ -318,7 +375,11 @@ tags:
         (_c = this.statusBarEl) == null ? void 0 : _c.setText("\u23F3 Transcribing\u2026");
         const transcript = await this.transcribeAudio(audioBlob);
         (_d = this.statusBarEl) == null ? void 0 : _d.setText("\u23F3 Summarising\u2026");
-        const summary = await this.summarise(transcript);
+        const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
+          processedAt: timestamp,
+          notePath: mode === "append" && targetNote ? targetNote : void 0,
+          sourceFilename: audioFilename
+        });
         if (mode === "append" && targetNote) {
           const targetFile = this.app.vault.getAbstractFileByPath(targetNote);
           if (targetFile instanceof import_obsidian.TFile) {
@@ -665,11 +726,29 @@ ${text}`).join("\n\n");
     }
     return chunks;
   }
-  async summarise(transcript) {
+  async summarise(transcript, context) {
+    var _a, _b, _c, _d;
     const { openaiEndpoint, openaiKey, openaiDeployment, summaryPrompt } = this.settings;
     const base = openaiEndpoint.replace(/\/$/, "");
-    const url = `${base}/openai/deployments/${openaiDeployment}/chat/completions?api-version=2024-08-01-preview`;
-    const response = await (0, import_obsidian.requestUrl)({
+    const url = `${base}/openai/deployments/${openaiDeployment}/chat/completions?api-version=2024-10-21`;
+    const contextLines = [`- Processed: ${context.processedAt}`];
+    if (context.fileModified)
+      contextLines.push(`- Audio file last modified (usually close to when it was recorded): ${context.fileModified}`);
+    if (context.sourceFilename)
+      contextLines.push(`- Audio file name: ${context.sourceFilename}`);
+    if (context.notePath)
+      contextLines.push(`- Being added to the note: ${context.notePath} (the folder and title usually identify the matter or client)`);
+    const extra = summaryPrompt.trim();
+    const userContent = [
+      "Context:",
+      ...contextLines,
+      ...extra ? ["", `Additional instructions: ${extra}`] : [],
+      "",
+      "Transcript:",
+      "",
+      transcript
+    ].join("\n");
+    const send = (withTemperature) => (0, import_obsidian.requestUrl)({
       url,
       method: "POST",
       headers: {
@@ -678,26 +757,123 @@ ${text}`).join("\n\n");
       },
       body: JSON.stringify({
         messages: [
-          {
-            role: "system",
-            content: "You are a helpful assistant that summarises voice note transcripts for a legal practitioner. Be concise and use markdown formatting."
-          },
-          {
-            role: "user",
-            content: `${summaryPrompt}
-
-${transcript}`
-          }
+          { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+          { role: "user", content: userContent }
         ],
-        temperature: 0.3,
-        max_tokens: 600
+        ...withTemperature ? { temperature: 0.2 } : {},
+        max_completion_tokens: _VoiceFilenotePlugin.SUMMARY_MAX_TOKENS
       }),
       throw: false
     });
+    let response = await send(true);
+    if (response.status === 400 && /temperature/i.test(response.text)) {
+      response = await send(false);
+    }
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`OpenAI API error ${response.status}: ${response.text}`);
     }
-    return response.json.choices[0].message.content;
+    const choice = (_a = response.json.choices) == null ? void 0 : _a[0];
+    const content = (_c = (_b = choice == null ? void 0 : choice.message) == null ? void 0 : _b.content) == null ? void 0 : _c.trim();
+    if (!content) {
+      throw new Error(`OpenAI returned an empty summary (finish_reason: ${(_d = choice == null ? void 0 : choice.finish_reason) != null ? _d : "unknown"})`);
+    }
+    if (choice.finish_reason === "length") {
+      return content + "\n\n> [!warning] Summary cut off\n> The summary hit the length limit and is incomplete. Check the transcript for anything after this point.";
+    }
+    return content;
+  }
+  // Shifts the summary's markdown headings so its top level sits directly
+  // under the note's own Summary heading (## in new notes, ### when appended).
+  nestHeadings(markdown, topLevel) {
+    const levels = [...markdown.matchAll(/^(#{1,6}) /gm)].map((m) => m[1].length);
+    if (levels.length === 0)
+      return markdown;
+    const shift = topLevel - Math.min(...levels);
+    return markdown.replace(/^(#{1,6}) /gm, (_, h) => "#".repeat(Math.min(6, Math.max(1, h.length + shift))) + " ");
+  }
+  // Never lets a summary failure lose the transcript: on error, returns a
+  // placeholder that the "Retry failed summaries" command can find later.
+  async summariseOrPlaceholder(transcript, timestamp, context) {
+    try {
+      return await this.summarise(transcript, context);
+    } catch (err) {
+      notify(
+        `Voice Filenote: summary failed (${err.message}). Transcript saved \u2014 run 'Retry failed summaries' to try again.`,
+        "error",
+        err
+      );
+      return this.summaryFailedPlaceholder(timestamp, err.message);
+    }
+  }
+  summaryFailedPlaceholder(timestamp, reason) {
+    const oneLine = reason.replace(/\s+/g, " ").slice(0, 300);
+    return `${_VoiceFilenotePlugin.SUMMARY_FAILED_START}
+> [!warning] Summary failed
+> Voice note ${timestamp}. The summary couldn't be generated: ${oneLine}
+> The transcript below is complete. Run **Retry failed summaries** to try again.
+${_VoiceFilenotePlugin.SUMMARY_FAILED_END}`;
+  }
+  // Finds summary-failed placeholders across the vault and regenerates each
+  // summary from the transcript section that follows it in the same note.
+  async retryFailedSummaries() {
+    var _a, _b, _c, _d, _e;
+    const { SUMMARY_FAILED_START: START, SUMMARY_FAILED_END: END } = _VoiceFilenotePlugin;
+    const files = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((await this.app.vault.cachedRead(f)).includes(START))
+        files.push(f);
+    }
+    if (files.length === 0) {
+      notify("Voice Filenote: no failed summaries found.");
+      return;
+    }
+    notify(`Voice Filenote: retrying failed summaries in ${files.length} note(s)\u2026`);
+    let fixed = 0;
+    let failed = 0;
+    for (const file of files) {
+      let content = await this.app.vault.read(file);
+      let searchFrom = 0;
+      while (true) {
+        const start = content.indexOf(START, searchFrom);
+        if (start < 0)
+          break;
+        const endMarker = content.indexOf(END, start);
+        if (endMarker < 0)
+          break;
+        const end = endMarker + END.length;
+        const block = content.slice(start, end);
+        const timestamp = (_b = (_a = block.match(/Voice note (\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})/)) == null ? void 0 : _a[1]) != null ? _b : "";
+        const rest = content.slice(end);
+        const transcriptMatch = rest.match(/^#{2,3} Transcript\n([\s\S]*?)(?=^#{2,3} Recording\b)/m);
+        if (!transcriptMatch || !transcriptMatch[1].trim()) {
+          notify(`Voice Filenote: couldn't find the transcript after a failed summary in ${file.basename} \u2014 skipped.`, "warn");
+          failed++;
+          searchFrom = end;
+          continue;
+        }
+        (_c = this.statusBarEl) == null ? void 0 : _c.setText("\u23F3 Summarising\u2026");
+        try {
+          const isVoiceNote = file.path.startsWith(`${this.settings.notesFolder}/`);
+          const summary = await this.summarise(transcriptMatch[1].trim(), {
+            processedAt: timestamp || (0, import_obsidian.moment)().format("YYYY-MM-DD HH-mm-ss"),
+            notePath: isVoiceNote ? void 0 : file.path
+          });
+          const summaryHeading = [...content.slice(0, start).matchAll(/^(#{2,3}) Summary$/gm)].pop();
+          const nested = this.nestHeadings(summary, ((_d = summaryHeading == null ? void 0 : summaryHeading[1].length) != null ? _d : 2) + 1);
+          content = content.slice(0, start) + nested + content.slice(end);
+          await this.app.vault.modify(file, content);
+          searchFrom = start + nested.length;
+          fixed++;
+        } catch (err) {
+          notify(`Voice Filenote: summary still failing for ${file.basename} \u2014 ${err.message}`, "error", err);
+          failed++;
+          searchFrom = end;
+        } finally {
+          (_e = this.statusBarEl) == null ? void 0 : _e.setText("");
+        }
+      }
+    }
+    notify(`Voice Filenote: ${fixed} summar${fixed === 1 ? "y" : "ies"} regenerated${failed ? `, ${failed} still failing` : ""}.`);
   }
   audioMimeType(filename) {
     var _a, _b, _c;
@@ -767,7 +943,7 @@ tags:
 
 ## Summary
 
-${summary}
+${this.nestHeadings(summary, 3)}
 
 ## Transcript
 
@@ -785,7 +961,7 @@ ${transcript}
 
 ### Summary
 
-${summary}
+${this.nestHeadings(summary, 4)}
 
 ### Transcript
 
@@ -807,6 +983,12 @@ var VoiceFilenotePlugin = _VoiceFilenotePlugin;
 // 524,288,000 bytes (500 MB). Stay a little under that to leave room
 // for multipart framing overhead.
 VoiceFilenotePlugin.MAX_UPLOAD_BYTES = 523e6;
+// A ceiling, not a target: the prompt asks for length proportional to the
+// recording. Reasoning models (GPT-5 onwards) spend part of this budget on
+// hidden reasoning before writing, so it's set well above a long file note.
+VoiceFilenotePlugin.SUMMARY_MAX_TOKENS = 16384;
+VoiceFilenotePlugin.SUMMARY_FAILED_START = "<!-- voice-filenote:summary-failed -->";
+VoiceFilenotePlugin.SUMMARY_FAILED_END = "<!-- /voice-filenote:summary-failed -->";
 var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -879,7 +1061,7 @@ var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Deployment name").setDesc("The name you gave the GPT-4o deployment").addText(
+    new import_obsidian.Setting(containerEl).setName("Deployment name").setDesc("The name you gave the model deployment, e.g. gpt-4o").addText(
       (t) => t.setPlaceholder("gpt-4o").setValue(this.plugin.settings.openaiDeployment).onChange(async (v) => {
         this.plugin.settings.openaiDeployment = v.trim();
         await this.plugin.saveSettings();
@@ -892,8 +1074,8 @@ var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Summary prompt").setDesc("Instruction sent to GPT-4o along with the transcript").addTextArea((t) => {
-      t.setPlaceholder("Provide a concise summary\u2026").setValue(this.plugin.settings.summaryPrompt).onChange(async (v) => {
+    new import_obsidian.Setting(containerEl).setName("Additional summary instructions").setDesc('Optional. Added to the built-in file-note instructions, e.g. "Always note any limitation dates mentioned." Leave blank to use the built-in instructions alone.').addTextArea((t) => {
+      t.setPlaceholder("Optional extra instructions\u2026").setValue(this.plugin.settings.summaryPrompt).onChange(async (v) => {
         this.plugin.settings.summaryPrompt = v;
         await this.plugin.saveSettings();
       });

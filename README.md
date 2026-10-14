@@ -3,7 +3,7 @@
 An Obsidian plugin that records audio, transcribes it, and summarises it — all in a single note. Built on Microsoft Azure so that your data never leaves Microsoft's infrastructure and is never used to train AI models.
 
 Each voice note produces a markdown file containing:
-- A concise AI-generated summary
+- An AI-generated summary, structured as a legal file note for meetings and calls, or as a short summary for dictation
 - The full transcript
 - An embedded audio recording
 
@@ -165,14 +165,22 @@ Go to **Settings → Voice Filenote** and fill in the following:
 | Setting | Default | Description |
 |---|---|---|
 | Notes folder | `Voice Notes` | Vault folder where new voice note files are created |
-| Summary prompt | *(see below)* | Instruction sent to GPT-4o along with the transcript |
+| Additional summary instructions | *(blank)* | Optional extra instructions added to the built-in summary instructions |
 
 > **Recordings** are saved to whatever folder you have configured under **Settings → Files and links → Default location for new attachments**. Voice Filenote reads this setting automatically — there is no separate folder to configure.
 
-The default summary prompt is:
-> Provide a concise summary of the following voice note transcript. Highlight key points and any action items.
+#### How summaries are written
 
-You can customise this to suit your workflow — for example, asking for dot-point action items, a structured legal file note format, or a particular writing style.
+The summary instructions are built into the plugin (`SUMMARY_SYSTEM_PROMPT` in `src/main.ts`). The model decides from the transcript which format to use:
+
+- **Conversation** (meeting, call): a file note with Attendees, Purpose, Facts and instructions, Advice given, Action items, Key details and To check.
+- **One speaker** (dictation): Summary, Action items, Key details and To check.
+
+The model is told to use only what's in the transcript, to use the speaker names you assign, and to list likely mis-transcriptions (often names) under **To check** rather than silently correcting them. It is also given the date, the uploaded file's name, and, when appending, the note's path, which usually identifies the matter.
+
+Use **Additional summary instructions** for anything extra, e.g. "Always note any limitation dates mentioned." Vaults that still had the old default prompt saved have it cleared automatically.
+
+If a summary hits the length limit, a **Summary cut off** warning is added below it.
 
 ---
 
@@ -228,7 +236,7 @@ If no note is open when you try to start a recording in append mode, the plugin 
 
 ### Commands
 
-Three commands are available in the command palette:
+These commands are available in the command palette:
 
 | Command | Behaviour |
 |---|---|
@@ -236,7 +244,15 @@ Three commands are available in the command palette:
 | Start / stop recording → new note | Always creates a new note, regardless of the default setting. |
 | Start / stop recording → append to current note | Always appends to the current open note, regardless of the default setting. |
 
-All three commands act as a toggle — run the command once to start, again to stop.
+| Transcribe audio file… | Transcribes an existing audio or video file. |
+| Retry pending transcriptions | Retries recordings saved while the Azure Speech quota was exceeded. |
+| Retry failed summaries | Regenerates summaries that failed (see below). |
+
+The three recording commands act as a toggle — run the command once to start, again to stop.
+
+### If a summary fails
+
+If the summary call fails (quota, timeout, server error), the note is still written with the full transcript and recording, and a **Summary failed** warning sits where the summary would be. Run **Retry failed summaries** to regenerate every failed summary in the vault from the transcript below it.
 
 ---
 
