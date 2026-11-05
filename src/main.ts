@@ -55,6 +55,7 @@ interface VoiceFilenoteSettings {
     openaiKey: string;
     openaiDeployment: string;
     language: string;
+    summariseWithAzure: boolean;
     summaryPrompt: string;
     notesFolder: string;
     defaultMode: RecordingMode;
@@ -129,6 +130,7 @@ const DEFAULT_SETTINGS: VoiceFilenoteSettings = {
     enableDiarization: false,
     maxSpeakers: 4,
     promptForSpeakerNames: true,
+    summariseWithAzure: true,
     summaryPrompt: "",
     notesFolder: "Voice Notes",
     defaultMode: "new",
@@ -225,8 +227,8 @@ export default class VoiceFilenotePlugin extends Plugin {
     }
 
     private async startRecording(mode: RecordingMode) {
-        const { speechKey, openaiKey, openaiEndpoint } = this.settings;
-        if (!speechKey || !openaiKey || !openaiEndpoint) {
+        const { speechKey, openaiKey, openaiEndpoint, summariseWithAzure } = this.settings;
+        if (!speechKey || (summariseWithAzure && (!openaiKey || !openaiEndpoint))) {
             notify(
                 "Voice Filenote: please fill in your API keys in Settings before recording.",
                 "warn"
@@ -342,7 +344,6 @@ export default class VoiceFilenotePlugin extends Plugin {
             throw err;
         }
 
-        this.statusBarEl?.setText("⏳ Summarising…");
         const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
             processedAt: timestamp,
             notePath: mode === "append" ? refNotePath : undefined,
@@ -392,7 +393,6 @@ export default class VoiceFilenotePlugin extends Plugin {
             throw err;
         }
 
-        this.statusBarEl?.setText("⏳ Summarising…");
         const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
             processedAt: timestamp,
             notePath: mode === "append" ? refNotePath : undefined,
@@ -473,7 +473,6 @@ tags:
                 this.statusBarEl?.setText("⏳ Transcribing…");
                 const transcript = await this.transcribeAudio(audioBlob);
 
-                this.statusBarEl?.setText("⏳ Summarising…");
                 const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
                     processedAt: timestamp,
                     notePath: mode === "append" && targetNote ? targetNote : undefined,
@@ -538,7 +537,7 @@ tags:
         timestamp: string,
         audioFilename: string,
         transcript: string,
-        summary: string
+        summary: string | null
     ) {
         await this.ensureFolder(this.settings.notesFolder);
         const notePath = `${this.settings.notesFolder}/Voice Note ${timestamp}.md`;
@@ -552,7 +551,7 @@ tags:
         timestamp: string,
         audioFilename: string,
         transcript: string,
-        summary: string
+        summary: string | null
     ) {
         const activeFile = this.app.workspace.getActiveFile();
         if (!activeFile || !(activeFile instanceof TFile)) {
@@ -1008,11 +1007,15 @@ tags:
 
     // Never lets a summary failure lose the transcript: on error, returns a
     // placeholder that the "Retry failed summaries" command can find later.
+    // Returns null when Azure summaries are turned off, so the note gets only
+    // the transcript and recording (the summary is then written in Claude Code).
     private async summariseOrPlaceholder(
         transcript: string,
         timestamp: string,
         context: SummaryContext
-    ): Promise<string> {
+    ): Promise<string | null> {
+        if (!this.settings.summariseWithAzure) return null;
+        this.statusBarEl?.setText("⏳ Summarising…");
         try {
             return await this.summarise(transcript, context);
         } catch (err) {
@@ -1161,8 +1164,13 @@ ${VoiceFilenotePlugin.SUMMARY_FAILED_END}`;
         timestamp: string,
         audioFilename: string,
         transcript: string,
-        summary: string
+        summary: string | null
     ): string {
+        const summarySection = summary === null ? "" : `## Summary
+
+${this.nestHeadings(summary, 3)}
+
+`;
         return `---
 created: ${timestamp}
 tags:
@@ -1171,11 +1179,7 @@ tags:
 
 # Voice Note — ${timestamp}
 
-## Summary
-
-${this.nestHeadings(summary, 3)}
-
-## Transcript
+${summarySection}## Transcript
 
 ${transcript}
 
@@ -1189,17 +1193,18 @@ ${transcript}
         timestamp: string,
         audioFilename: string,
         transcript: string,
-        summary: string
+        summary: string | null
     ): string {
+        const summarySection = summary === null ? "" : `### Summary
+
+${this.nestHeadings(summary, 4)}
+
+`;
         return `---
 
 ## Voice Note — ${timestamp}
 
-### Summary
-
-${this.nestHeadings(summary, 4)}
-
-### Transcript
+${summarySection}### Transcript
 
 ${transcript}
 
@@ -1336,6 +1341,18 @@ class VoiceFilenoteSettingTab extends PluginSettingTab {
 
         // ── OpenAI ──────────────────────────────────────────────────────────
         containerEl.createEl("h3", { text: "Azure OpenAI (summarisation)" });
+
+        new Setting(containerEl)
+            .setName("Summarise with Azure OpenAI")
+            .setDesc("Turn off to save only the transcript and recording. You can then write the summary in Claude Code with /filenote. The settings below are only used when this is on.")
+            .addToggle((t) =>
+                t
+                    .setValue(this.plugin.settings.summariseWithAzure)
+                    .onChange(async (v) => {
+                        this.plugin.settings.summariseWithAzure = v;
+                        await this.plugin.saveSettings();
+                    })
+            );
 
         new Setting(containerEl)
             .setName("Endpoint")
