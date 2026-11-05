@@ -89,6 +89,7 @@ var DEFAULT_SETTINGS = {
   enableDiarization: false,
   maxSpeakers: 4,
   promptForSpeakerNames: true,
+  summariseWithAzure: true,
   summaryPrompt: "",
   notesFolder: "Voice Notes",
   defaultMode: "new"
@@ -172,8 +173,8 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
   }
   async startRecording(mode) {
     var _a, _b, _c;
-    const { speechKey, openaiKey, openaiEndpoint } = this.settings;
-    if (!speechKey || !openaiKey || !openaiEndpoint) {
+    const { speechKey, openaiKey, openaiEndpoint, summariseWithAzure } = this.settings;
+    if (!speechKey || summariseWithAzure && (!openaiKey || !openaiEndpoint)) {
       notify(
         "Voice Filenote: please fill in your API keys in Settings before recording.",
         "warn"
@@ -242,7 +243,7 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     this.isRecording = false;
   }
   async processRecording(audioBlob, mimeType, mode) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e;
     const timestamp = (0, import_obsidian.moment)().format("YYYY-MM-DD HH-mm-ss");
     const ext = mimeType.includes("ogg") ? "ogg" : "webm";
     const audioFilename = `Recording ${timestamp}.${ext}`;
@@ -267,7 +268,6 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       }
       throw err;
     }
-    (_f = this.statusBarEl) == null ? void 0 : _f.setText("\u23F3 Summarising\u2026");
     const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
       processedAt: timestamp,
       notePath: mode === "append" ? refNotePath : void 0
@@ -279,7 +279,7 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
     }
   }
   async processAudioFile(file, mode) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const timestamp = (0, import_obsidian.moment)().format("YYYY-MM-DD HH-mm-ss");
     const refNotePath = mode === "append" ? (_b = (_a = this.app.workspace.getActiveFile()) == null ? void 0 : _a.path) != null ? _b : "" : `${this.settings.notesFolder}/Voice Note ${timestamp}.md`;
     const attachFolder = this.resolveAttachmentFolder(refNotePath);
@@ -307,14 +307,13 @@ var _VoiceFilenotePlugin = class extends import_obsidian.Plugin {
       (_g = this.statusBarEl) == null ? void 0 : _g.setText("");
       throw err;
     }
-    (_h = this.statusBarEl) == null ? void 0 : _h.setText("\u23F3 Summarising\u2026");
     const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
       processedAt: timestamp,
       notePath: mode === "append" ? refNotePath : void 0,
       sourceFilename: file.name,
       fileModified: file.lastModified ? (0, import_obsidian.moment)(file.lastModified).format("YYYY-MM-DD HH:mm") : void 0
     });
-    (_i = this.statusBarEl) == null ? void 0 : _i.setText("");
+    (_h = this.statusBarEl) == null ? void 0 : _h.setText("");
     if (mode === "append") {
       await this.appendToCurrentNote(timestamp, file.name, transcript, summary);
     } else {
@@ -344,7 +343,7 @@ tags:
     await this.app.vault.create(notePath, content);
   }
   async retryPendingTranscriptions() {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d;
     const pending = this.app.vault.getMarkdownFiles().filter((f) => {
       var _a2;
       const cache = this.app.metadataCache.getFileCache(f);
@@ -374,7 +373,6 @@ tags:
         const audioFilename = audioFile.name;
         (_c = this.statusBarEl) == null ? void 0 : _c.setText("\u23F3 Transcribing\u2026");
         const transcript = await this.transcribeAudio(audioBlob);
-        (_d = this.statusBarEl) == null ? void 0 : _d.setText("\u23F3 Summarising\u2026");
         const summary = await this.summariseOrPlaceholder(transcript, timestamp, {
           processedAt: timestamp,
           notePath: mode === "append" && targetNote ? targetNote : void 0,
@@ -405,7 +403,7 @@ tags:
         }
         notify(`Voice Filenote: retry failed for ${stubFile.basename} \u2014 ${err.message}`, "error", err);
       } finally {
-        (_e = this.statusBarEl) == null ? void 0 : _e.setText("");
+        (_d = this.statusBarEl) == null ? void 0 : _d.setText("");
       }
     }
   }
@@ -793,7 +791,13 @@ ${text}`).join("\n\n");
   }
   // Never lets a summary failure lose the transcript: on error, returns a
   // placeholder that the "Retry failed summaries" command can find later.
+  // Returns null when Azure summaries are turned off, so the note gets only
+  // the transcript and recording (the summary is then written in Claude Code).
   async summariseOrPlaceholder(transcript, timestamp, context) {
+    var _a;
+    if (!this.settings.summariseWithAzure)
+      return null;
+    (_a = this.statusBarEl) == null ? void 0 : _a.setText("\u23F3 Summarising\u2026");
     try {
       return await this.summarise(transcript, context);
     } catch (err) {
@@ -933,6 +937,11 @@ Content-Type: ${mimeType}\r
     };
   }
   buildNewNoteContent(timestamp, audioFilename, transcript, summary) {
+    const summarySection = summary === null ? "" : `## Summary
+
+${this.nestHeadings(summary, 3)}
+
+`;
     return `---
 created: ${timestamp}
 tags:
@@ -941,11 +950,7 @@ tags:
 
 # Voice Note \u2014 ${timestamp}
 
-## Summary
-
-${this.nestHeadings(summary, 3)}
-
-## Transcript
+${summarySection}## Transcript
 
 ${transcript}
 
@@ -955,15 +960,16 @@ ${transcript}
 `;
   }
   buildAppendContent(timestamp, audioFilename, transcript, summary) {
+    const summarySection = summary === null ? "" : `### Summary
+
+${this.nestHeadings(summary, 4)}
+
+`;
     return `---
 
 ## Voice Note \u2014 ${timestamp}
 
-### Summary
-
-${this.nestHeadings(summary, 4)}
-
-### Transcript
+${summarySection}### Transcript
 
 ${transcript}
 
@@ -1049,6 +1055,12 @@ var VoiceFilenoteSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     containerEl.createEl("h3", { text: "Azure OpenAI (summarisation)" });
+    new import_obsidian.Setting(containerEl).setName("Summarise with Azure OpenAI").setDesc("Turn off to save only the transcript and recording. You can then write the summary in Claude Code with /filenote. The settings below are only used when this is on.").addToggle(
+      (t) => t.setValue(this.plugin.settings.summariseWithAzure).onChange(async (v) => {
+        this.plugin.settings.summariseWithAzure = v;
+        await this.plugin.saveSettings();
+      })
+    );
     new import_obsidian.Setting(containerEl).setName("Endpoint").setDesc("Endpoint URL from your Azure OpenAI resource").addText(
       (t) => t.setPlaceholder("https://my-openai.openai.azure.com/").setValue(this.plugin.settings.openaiEndpoint).onChange(async (v) => {
         this.plugin.settings.openaiEndpoint = v.trim();
